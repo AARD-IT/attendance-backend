@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class AutomationScheduler:
     AUTO_REFRESH_INTERVAL_SECONDS = 60 * 60
+    SYNC_INTERVAL_SECONDS = 60
 
     def __init__(self) -> None:
         self._thread: Optional[threading.Thread] = None
@@ -21,7 +22,7 @@ class AutomationScheduler:
 
     def _should_run_ceo_refresh(self, current_time: float | None = None) -> bool:
         current_time = time.monotonic() if current_time is None else current_time
-        return (current_time - self._last_ceo_refresh_at) >= self.AUTO_REFRESH_INTERVAL_SECONDS
+        return (current_time - self._last_ceo_refresh_at) >= self.SYNC_INTERVAL_SECONDS
 
     def _run_ceo_auto_refresh(self) -> None:
         try:
@@ -53,7 +54,7 @@ class AutomationScheduler:
                     self._last_ceo_refresh_at = time.monotonic()
             except Exception as exc:
                 logger.warning("automation scheduler tick failed: %s", exc)
-            self._stop_event.wait(60)
+            self._stop_event.wait(self.SYNC_INTERVAL_SECONDS)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():

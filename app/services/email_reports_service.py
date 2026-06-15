@@ -356,6 +356,62 @@ class EmailReportsService:
         label = normalized.replace("_", " ")
         return f"<p>Hello {html.escape(employee_name or 'Employee')},</p><p>This is your automated {html.escape(label)} notification from the Attendance Dashboard.</p>"
 
+    def _find_existing_monthly_report(self, employee_id: str, subject: str) -> Dict[str, Any] | None:
+        if not employee_id or not subject:
+            return None
+
+        params = {
+            "select": "*",
+            "employee_id": f"eq.{employee_id}",
+            "email_type": "eq.monthly_report",
+            "subject": f"eq.{subject}",
+        }
+
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(self._table_url(), headers=SUPABASE_HEADERS_SERVICE, params=params)
+
+        rows = self._safe_json(response, action="_find_existing_monthly_report", fallback=[])
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
+    def _claim_monthly_report(self, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+        if not payload:
+            return None
+
+        params = {"on_conflict": "employee_id,email_type,subject"}
+        headers = {**SUPABASE_HEADERS_SERVICE, "Prefer": "resolution=ignore-duplicates,return=representation"}
+
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(self._table_url(), headers=headers, params=params, json=payload)
+
+        rows = self._safe_json(response, action="_claim_monthly_report", fallback=[])
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        if isinstance(rows, dict) and rows:
+            return rows
+
+        # If Supabase returned no rows because the row already existed, fetch the existing row explicitly.
+        existing = self._find_existing_monthly_report(str(payload.get("employee_id") or ""), str(payload.get("subject") or ""))
+        return existing
+
+    def _update_activity_log(self, log_id: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+        if not log_id:
+            return None
+
+        url = self._table_url()
+        params = {"id": f"eq.{log_id}"}
+
+        with httpx.Client(timeout=10.0) as client:
+            response = client.patch(url, headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "return=representation"}, params=params, json=payload)
+
+        rows = self._safe_json(response, action="_update_activity_log", fallback=[])
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        if isinstance(rows, dict):
+            return rows
+        return None
+
     def send_email(self, recipient_email: str, subject: str, email_body: str, email_type: str, employee_name: str, cc_recipients: list[str] | None = None, attachments: list[dict[str, Any]] | None = None) -> str:
         api_key = (getattr(settings, "RESEND_API_KEY", None) or os.getenv("RESEND_API_KEY") or "").strip()
         from_email = (getattr(settings, "RESEND_FROM_EMAIL", None) or os.getenv("RESEND_FROM_EMAIL") or "").strip()
@@ -464,6 +520,32 @@ class EmailReportsService:
         subject = self._subject_for(email_type, context)
         email_body = self._body_for(employee_name, email_type, context)
 
+        log_id: str | None = None
+        if str(email_type).lower() == "monthly_report" and not skip_send:
+            existing_log = self._find_existing_monthly_report(employee_id, subject)
+            if existing_log and str(existing_log.get("status") or "").lower() in {"sent", "pending"}:
+                return existing_log
+
+            claim_payload = {
+                "employee_id": employee_id,
+                "employee_name": employee_name,
+                "employee_email": recipient_email or None,
+                "cc_email": None,
+                "email_type": email_type,
+                "subject": subject,
+                "email_body": email_body,
+                "status": "pending",
+                "provider": provider,
+                "provider_message_id": None,
+                "sent_at": "now()",
+                "created_at": "now()",
+            }
+            claimed_log = self._claim_monthly_report(claim_payload)
+            if not claimed_log or not claimed_log.get("id"):
+                raise RuntimeError("Unable to claim monthly report email activity")
+
+            log_id = str(claimed_log.get("id"))
+
         try:
             if not skip_send:
                 attachments = None
@@ -512,11 +594,20 @@ class EmailReportsService:
             "sent_at": "now()",
         }
 
-        with httpx.Client(timeout=10.0) as client:
-            response = client.post(self._table_url(), headers=SUPABASE_HEADERS_SERVICE, json=payload)
-
-        rows = self._safe_json(response, action="log_activity", fallback=[])
-        result = rows[0] if isinstance(rows, list) and rows else rows
+        if log_id and str(email_type).lower() == "monthly_report":
+            update_payload = {
+                "status": normalized_status,
+                "provider_message_id": provider_message_id,
+                "sent_at": "now()",
+                "email_body": email_body,
+            }
+            updated_log = self._update_activity_log(log_id, update_payload)
+            result = updated_log or existing_log or payload
+        else:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(self._table_url(), headers=SUPABASE_HEADERS_SERVICE, json=payload)
+            rows = self._safe_json(response, action="log_activity", fallback=[])
+            result = rows[0] if isinstance(rows, list) and rows else rows
 
         if failure_error is not None:
             raise RuntimeError(f"Resend email delivery failed: {failure_error}") from failure_error

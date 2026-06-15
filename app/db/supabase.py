@@ -4,6 +4,7 @@ Handles all communication with Supabase API including authentication and databas
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import httpx
 from fastapi import HTTPException, status
@@ -537,6 +538,106 @@ class SupabaseClient:
             logger.exception("Error upserting attendance record (request error)")
             return {"success": False, "error": str(req_err), "type": "request_error"}
     
+    @staticmethod
+    def fetch_last_sync_state() -> Optional[Dict[str, Any]]:
+        """Fetch the most recent Minerva sync marker for incremental fetches."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/minerva_sync_state"
+        params = {"select": "*", "id": "eq.global", "limit": "1"}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url, headers=SUPABASE_HEADERS_SERVICE, params=params)
+            if response.status_code != 200:
+                return None
+            results = response.json()
+            return results[0] if isinstance(results, list) and results else None
+        except httpx.RequestError:
+            return None
+
+    @staticmethod
+    def upsert_sync_state(records_synced: int, status: str = "OK") -> Dict[str, Any]:
+        """Upsert the Minerva sync status for incremental fetch tracking."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/minerva_sync_state"
+        data = {
+            "id": "global",
+            "last_sync_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "records_synced": records_synced,
+            "status": status,
+        }
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    url,
+                    json=data,
+                    params={"on_conflict": "id"},
+                    headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "resolution=merge-duplicates,return=representation"},
+                )
+            if response.status_code in (200, 201):
+                result = response.json()
+                return result[0] if isinstance(result, list) and result else data
+            return {"success": False, "error": response.text}
+        except httpx.RequestError as exc:
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def upsert_minerva_raw_log(transaction: Dict[str, Any]) -> Dict[str, Any]:
+        """Store each Minerva punch event in the raw log table."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/minerva_raw_logs"
+        payload = {
+            "employee_code": str(transaction.get("emp_code") or "").strip(),
+            "employee_id": transaction.get("employee_id"),
+            "timestamp": transaction.get("punch_time"),
+            "raw_payload": transaction,
+        }
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    url,
+                    json=payload,
+                    headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "return=representation"},
+                )
+            if response.status_code in (200, 201):
+                result = response.json()
+                return result[0] if isinstance(result, list) and result else payload
+            return {"success": False, "error": response.text}
+        except httpx.RequestError as exc:
+            logger.warning("Failed to store raw Minerva log: %s", exc)
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def upsert_daily_attendance_record(
+        employee_id: str,
+        attendance_date: str,
+        first_punch: str,
+        last_punch: str,
+        working_hours: float,
+        attendance_status: str,
+    ) -> Dict[str, Any]:
+        """Upsert the normalized first/last-punch attendance record for analytics."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/attendance_daily"
+        data = {
+            "employee_id": employee_id,
+            "attendance_date": attendance_date,
+            "first_punch": first_punch,
+            "last_punch": last_punch,
+            "working_hours": working_hours,
+            "attendance_status": attendance_status,
+        }
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    url,
+                    json=data,
+                    params={"on_conflict": "employee_id,attendance_date"},
+                    headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "resolution=merge-duplicates,return=representation"},
+                )
+            if response.status_code in (200, 201):
+                result = response.json()
+                return result[0] if isinstance(result, list) and result else {"success": True, "data": data}
+            return {"success": False, "error": response.text, "status_code": response.status_code}
+        except httpx.RequestError as exc:
+            logger.warning("Failed to update daily attendance: %s", exc)
+            return {"success": False, "error": str(exc)}
+
     @staticmethod
     def fetch_attendance_record(
         employee_id: str,

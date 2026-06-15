@@ -82,7 +82,74 @@ class AutomationEmailService:
         except ValueError:
             return None
 
+    def _as_month(self, value: Any) -> str | None:
+        if not value:
+            return None
+        text = str(value).strip()
+        if len(text) == 7 and text[4] == "-" and text[:4].isdigit() and text[5:7].isdigit():
+            return text
+        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            return text[:7]
+        return None
+
+    def _month_label_for(self, target_month: str) -> str | None:
+        if not target_month or len(target_month) != 7 or target_month[4] != "-":
+            return None
+        try:
+            year = int(target_month[:4])
+            month = int(target_month[5:7])
+            return datetime(year, month, 1).strftime("%B %Y")
+        except ValueError:
+            return None
+
+    def _has_sent_monthly_report(self, employee_id: str, target_month: str) -> bool:
+        if not target_month:
+            return False
+        target_label = self._month_label_for(target_month)
+        if not target_label:
+            return False
+        rows = self._fetch_activity_logs(employee_id=employee_id, email_type="monthly_report")
+        for row in rows:
+            subject = str(row.get("subject") or "")
+            if target_label in subject and str(row.get("status") or "").upper() in {"SENT", "PENDING"}:
+                return True
+        return False
+
+    def _monthly_report_subject(self, target_month: str | None, context: Dict[str, Any] | None = None) -> str:
+        if target_month:
+            month_label = self._month_label_for(target_month)
+            if month_label:
+                return f"Monthly Attendance Report – {month_label}"
+        return email_reports_service._subject_for("monthly_report", context or {})
+
+    def send_monthly_reports(self, target_month: str | None = None) -> List[Dict[str, Any]]:
+        month_label = target_month or date.today().replace(day=1).isoformat()[:7]
+        records = attendance_service.get_all_attendance(limit=1000, start_date=f"{month_label}-01", end_date=f"{month_label}-31").get("records", [])
+        sent = []
+        processed_employee_ids: set[str] = set()
+
+        for record in records:
+            employee_id = str(record.get("employee_id") or "")
+            if not employee_id or employee_id in processed_employee_ids:
+                continue
+            employee_name = str(record.get("employee_name") or "Employee")
+            recipient_email = str(record.get("employee_email") or record.get("recipient_email") or "")
+            attendance_date = f"{month_label}-01"
+            subject = self._monthly_report_subject(month_label, {"employee_id": employee_id, "employee_name": employee_name, "month": int(month_label[5:7]), "year": int(month_label[:4])})
+            if self._find_existing_monthly_report(employee_id, subject):
+                processed_employee_ids.add(employee_id)
+                continue
+            activity = self._send_if_enabled(employee_id, employee_name, recipient_email, "monthly_report", attendance_date)
+            if activity:
+                sent.append(activity)
+            processed_employee_ids.add(employee_id)
+        return sent
+
     def should_send_alert(self, employee_id: str, attendance_date: str, email_type: str) -> bool:
+        if str(email_type).lower() == "monthly_report":
+            target_month = self._as_month(attendance_date)
+            return not self._has_sent_monthly_report(employee_id, target_month or "")
+
         rows = self._fetch_activity_logs(employee_id=employee_id, email_type=email_type)
         target_day = self._as_date(attendance_date)
         for row in rows:
@@ -96,6 +163,20 @@ class AutomationEmailService:
             if str(row.get("employee_id") or "") == str(employee_id):
                 return str(row.get(mode_name) or "manual").lower()
         return "manual"
+
+    def _attendance_record_is_complete(self, record: Dict[str, Any] | None) -> bool:
+        return bool(record and record.get("first_punch") and record.get("last_punch"))
+
+    def _fetch_normalized_record(self, employee_id: str, attendance_date: str) -> Dict[str, Any] | None:
+        if not employee_id or not attendance_date:
+            return None
+
+        daily_records = attendance_service.get_daily_attendance(limit=1, employee_id=employee_id, start_date=attendance_date, end_date=attendance_date).get("records", [])
+        if daily_records:
+            return daily_records[0]
+
+        record_list = attendance_service.get_all_attendance(limit=1, employee_id=employee_id, start_date=attendance_date, end_date=attendance_date).get("records", [])
+        return record_list[0] if record_list else None
 
     def _send_if_enabled(self, employee_id: str, employee_name: str, recipient_email: str, email_type: str, attendance_date: str) -> Dict[str, Any] | None:
         if not recipient_email:
@@ -111,11 +192,9 @@ class AutomationEmailService:
         if not self.should_send_alert(employee_id, attendance_date, email_type):
             return {"status": "skipped", "reason": "duplicate"}
         try:
-            record = None
-            if attendance_date:
-                record_list = attendance_service.get_all_attendance(limit=1, employee_id=employee_id, start_date=attendance_date, end_date=attendance_date).get("records", [])
-                if record_list:
-                    record = record_list[0]
+            record = self._fetch_normalized_record(employee_id, attendance_date)
+            if email_type in {"late_login_alert", "early_logout_alert"} and not self._attendance_record_is_complete(record):
+                return None
             classification = AttendanceShiftEngine.classify_record(record) if record else {}
             month = int(attendance_date[5:7]) if isinstance(attendance_date, str) and len(attendance_date) >= 7 and attendance_date[4] == "-" else None
             year = int(attendance_date[:4]) if isinstance(attendance_date, str) and len(attendance_date) >= 4 else None
@@ -158,25 +237,15 @@ class AutomationEmailService:
             )
             raise RuntimeError(f"Resend email delivery failed: {exc}") from exc
 
-    def send_monthly_reports(self, target_month: str | None = None) -> List[Dict[str, Any]]:
-        month_label = target_month or date.today().replace(day=1).isoformat()[:7]
-        records = attendance_service.get_all_attendance(limit=1000, start_date=f"{month_label}-01", end_date=f"{month_label}-31").get("records", [])
-        sent = []
-        for record in records:
-            employee_id = str(record.get("employee_id") or "")
-            employee_name = str(record.get("employee_name") or "Employee")
-            recipient_email = str(record.get("employee_email") or record.get("recipient_email") or "")
-            attendance_date = str(record.get("attendance_date") or month_label)
-            activity = self._send_if_enabled(employee_id, employee_name, recipient_email, "monthly_report", attendance_date)
-            if activity:
-                sent.append(activity)
-        return sent
-
     def send_late_login_alerts(self, attendance_date: str | None = None) -> List[Dict[str, Any]]:
         target_date = attendance_date or date.today().isoformat()
-        records = attendance_service.get_all_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
+        records = attendance_service.get_daily_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
+        if not records:
+            records = attendance_service.get_all_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
         sent = []
         for record in records:
+            if not self._attendance_record_is_complete(record):
+                continue
             classification = AttendanceShiftEngine.classify_record(record)
             if not classification.get("is_late"):
                 continue
@@ -190,9 +259,13 @@ class AutomationEmailService:
 
     def send_early_logout_alerts(self, attendance_date: str | None = None) -> List[Dict[str, Any]]:
         target_date = attendance_date or date.today().isoformat()
-        records = attendance_service.get_all_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
+        records = attendance_service.get_daily_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
+        if not records:
+            records = attendance_service.get_all_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
         sent = []
         for record in records:
+            if not self._attendance_record_is_complete(record):
+                continue
             classification = AttendanceShiftEngine.classify_record(record)
             if not classification.get("is_early_out"):
                 continue

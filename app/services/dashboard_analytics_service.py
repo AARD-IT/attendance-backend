@@ -60,13 +60,35 @@ class DashboardAnalyticsService:
 
     @staticmethod
     def _fetch_records(table: str) -> List[Dict[str, Any]]:
-        url = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/{table}"
+        preferred_table = table
+        if table == "attendance_records":
+            preferred_table = "attendance_daily"
+
+        url = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/{preferred_table}"
         try:
             with httpx.Client(timeout=10.0) as client:
                 response = client.get(url, headers=HEADERS)
-            if response.status_code != 200:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch {table}")
-            return response.json()
+            if response.status_code == 200:
+                rows = response.json()
+                if preferred_table == "attendance_daily":
+                    return [
+                        {
+                            **row,
+                            "total_hours": row.get("working_hours") if row.get("working_hours") is not None else row.get("total_hours", 0),
+                            "status": row.get("attendance_status") if row.get("attendance_status") is not None else row.get("status", "ABSENT"),
+                        }
+                        for row in rows
+                    ]
+                return rows
+
+            if table == "attendance_records":
+                fallback_url = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/attendance_records"
+                with httpx.Client(timeout=10.0) as client:
+                    fallback_response = client.get(fallback_url, headers=HEADERS)
+                if fallback_response.status_code == 200:
+                    return fallback_response.json()
+
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch {table}")
         except httpx.RequestError as exc:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Supabase request failed") from exc
 

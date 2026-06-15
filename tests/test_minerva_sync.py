@@ -296,6 +296,15 @@ class TestMinervaSyncService:
         assert start_date == "2026-12-01"
         assert end_date == "2027-01-10"
 
+    def test_build_sync_window_uses_last_sync_timestamp_for_incremental_sync(self, sync_service):
+        """Incremental sync should use the stored last sync timestamp instead of a full historical window."""
+        last_sync = datetime(2026, 6, 10, 12, 30, 0)
+
+        start_date, end_date = sync_service._build_sync_window(date(2026, 6, 15), last_sync_timestamp=last_sync)
+
+        assert start_date == "2026-06-10T12:30:00"
+        assert end_date == "2026-06-15"
+
     def test_get_transactions_uses_date_filters(self):
         """Minerva transaction fetching should pass start_date/end_date to the API."""
         client = MinervaClient()

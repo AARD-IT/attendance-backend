@@ -325,3 +325,48 @@ def test_should_send_alert_prevents_duplicate_employee_day(monkeypatch):
     monkeypatch.setattr(service, "_fetch_activity_logs", fake_fetch_logs)
 
     assert service.should_send_alert("emp-1", "2026-06-11", "late_login_alert") is False
+
+
+def test_should_send_monthly_report_only_once_per_month(monkeypatch):
+    service = AutomationEmailService()
+
+    def fake_fetch_logs(*args, **kwargs):
+        return [
+            {
+                "employee_id": "emp-1",
+                "email_type": "monthly_report",
+                "status": "SENT",
+                "subject": "Monthly Attendance Report – June 2026",
+                "sent_at": "2026-06-05T09:15:00",
+            }
+        ]
+
+    monkeypatch.setattr(service, "_fetch_activity_logs", fake_fetch_logs)
+
+    assert service.should_send_alert("emp-1", "2026-06", "monthly_report") is False
+
+
+def test_send_late_login_alerts_skip_incomplete_daily_records(monkeypatch):
+    service = AutomationEmailService()
+
+    def fake_daily_attendance(*args, **kwargs):
+        return {"records": [{"employee_id": "emp-1", "first_punch": None, "last_punch": None}]}
+
+    monkeypatch.setattr("app.services.attendance_service.attendance_service.get_daily_attendance", fake_daily_attendance)
+    monkeypatch.setattr("app.services.attendance_service.attendance_service.get_all_attendance", lambda *args, **kwargs: {"records": []})
+
+    result = service.send_late_login_alerts("2026-06-11")
+    assert result == []
+
+
+def test_send_early_logout_alerts_skip_incomplete_daily_records(monkeypatch):
+    service = AutomationEmailService()
+
+    def fake_daily_attendance(*args, **kwargs):
+        return {"records": [{"employee_id": "emp-1", "first_punch": None, "last_punch": None}]}
+
+    monkeypatch.setattr("app.services.attendance_service.attendance_service.get_daily_attendance", fake_daily_attendance)
+    monkeypatch.setattr("app.services.attendance_service.attendance_service.get_all_attendance", lambda *args, **kwargs: {"records": []})
+
+    result = service.send_early_logout_alerts("2026-06-11")
+    assert result == []

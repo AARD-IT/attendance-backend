@@ -128,10 +128,31 @@ class MinervaSyncService:
         """Compatibility wrapper for upserting an attendance record."""
         return SupabaseClient.upsert_attendance_record(*args, **kwargs)
 
+    def _store_raw_log(self, *args, **kwargs):
+        """Compatibility wrapper for storing raw Minerva punches."""
+        return SupabaseClient.upsert_minerva_raw_log(*args, **kwargs)
+
+    def _store_daily_attendance(self, *args, **kwargs):
+        """Compatibility wrapper for storing normalized daily attendance."""
+        return SupabaseClient.upsert_daily_attendance_record(*args, **kwargs)
+
     @staticmethod
-    def _build_sync_window(reference_date: Optional[date] = None) -> Tuple[str, str]:
-        """Return a two-month sync window: previous month through today."""
+    def _build_sync_window(reference_date: Optional[date] = None, last_sync_timestamp: Optional[datetime] = None) -> Tuple[str, str]:
+        """Return the sync window used for Minerva fetches.
+
+        When a last sync timestamp is available, fetch only the delta since that time.
+        Otherwise use the previous month through today to avoid a full historical reload.
+        """
         today = reference_date or date.today()
+
+        if last_sync_timestamp is not None:
+            if last_sync_timestamp.tzinfo is None:
+                normalized = last_sync_timestamp.replace(tzinfo=timezone.utc)
+            else:
+                normalized = last_sync_timestamp.astimezone(timezone.utc)
+            normalized = normalized.replace(microsecond=0)
+            return normalized.isoformat(timespec="seconds").replace('+00:00', ''), today.isoformat()
+
         current_month = today.month
         current_year = today.year
 
@@ -362,6 +383,22 @@ class MinervaSyncService:
             "total_hours": round(total_hours, 2),
         }
 
+    def get_last_sync_state(self) -> Optional[Dict[str, Any]]:
+        """Read the last Minerva sync marker from Supabase, if present."""
+        try:
+            return SupabaseClient.fetch_last_sync_state()
+        except Exception as exc:
+            logger.warning("Unable to fetch Minerva sync state: %s", exc)
+            return None
+
+    def save_sync_state(self, records_synced: int, status: str = "OK") -> Dict[str, Any]:
+        """Persist the last successful sync metadata for incremental fetches."""
+        try:
+            return SupabaseClient.upsert_sync_state(records_synced=records_synced, status=status)
+        except Exception as exc:
+            logger.warning("Unable to persist Minerva sync state: %s", exc)
+            return {"success": False, "error": str(exc)}
+
     def sync_attendance(self) -> Dict[str, Any]:
         """
         Sync attendance data from Minerva to Supabase attendance_records.
@@ -382,9 +419,16 @@ class MinervaSyncService:
         }
 
         try:
-            # Fetch only the previous month and current month to keep refreshes fast.
-            start_date, end_date = self._build_sync_window()
-            logger.info("Attendance sync window start_date=%s end_date=%s", start_date, end_date)
+            last_sync = self.get_last_sync_state()
+            last_sync_timestamp = None
+            if last_sync and last_sync.get("last_sync_at"):
+                try:
+                    last_sync_timestamp = datetime.fromisoformat(str(last_sync["last_sync_at"]).replace("Z", "+00:00"))
+                except ValueError:
+                    logger.warning("Ignoring invalid last_sync_at value: %s", last_sync.get("last_sync_at"))
+
+            start_date, end_date = self._build_sync_window(last_sync_timestamp=last_sync_timestamp)
+            logger.info("Attendance sync window start_date=%s end_date=%s last_sync=%s", start_date, end_date, last_sync_timestamp)
             minerva_data = self.minerva_client.get_transactions(start_date=start_date, end_date=end_date)
             transactions = minerva_data.get('data', []) if isinstance(minerva_data, dict) else minerva_data
             
@@ -478,8 +522,19 @@ class MinervaSyncService:
 
                     existing_record = self._get_attendance_record(employee_id, attendance_date)
 
-                    # Upsert attendance record
-                    result = self._insert_attendance_record(
+                    for item in sorted_transactions:
+                        self._store_raw_log({**item['transaction'], 'employee_id': employee_id})
+
+                    result = self._store_daily_attendance(
+                        employee_id=employee_id,
+                        attendance_date=attendance_date,
+                        first_punch=first_punch.astimezone().isoformat(),
+                        last_punch=last_punch.astimezone().isoformat(),
+                        working_hours=total_hours,
+                        attendance_status=status,
+                    )
+
+                    fallback_result = self._insert_attendance_record(
                         employee_id=employee_id,
                         attendance_date=attendance_date,
                         first_punch=first_punch.astimezone().isoformat(),
@@ -488,6 +543,7 @@ class MinervaSyncService:
                         status=status,
                         minerva_transaction_id=minerva_transaction_id if minerva_transaction_id else None
                     )
+                    result = result if isinstance(result, dict) and result.get("success") is not False else fallback_result
 
                     if isinstance(result, dict):
                         if result.get("success"):
@@ -521,6 +577,8 @@ class MinervaSyncService:
 
             execution_time = (datetime.utcnow() - start_time).total_seconds()
             stats["execution_time_seconds"] = execution_time
+            stats["last_sync_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace('+00:00', 'Z')
+            self.save_sync_state(records_synced=stats.get("inserted", 0) + stats.get("updated", 0), status="OK" if stats.get("errors", 0) == 0 else "WARN")
             logger.info(f"Attendance sync completed in {execution_time:.2f}s - Stats: {stats}")
 
         except Exception as e:

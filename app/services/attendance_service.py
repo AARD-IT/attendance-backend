@@ -81,6 +81,53 @@ class AttendanceService:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Attendance service unavailable")
 
     @staticmethod
+    def get_daily_attendance(page: int = 1, limit: int = 20, employee_id: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        params["limit"] = limit
+        params["offset"] = (page - 1) * limit
+
+        if employee_id:
+            params["employee_id"] = f"eq.{employee_id}"
+
+        if start_date or end_date:
+            date_filters = []
+            if start_date:
+                date_filters.append(f"gte.{start_date}")
+            if end_date:
+                date_filters.append(f"lte.{end_date}")
+            params["attendance_date"] = date_filters
+
+        url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_daily"
+
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(
+                    url,
+                    headers={**AttendanceService.SUPABASE_HEADERS, "Prefer": "count=exact"},
+                    params=params,
+                )
+
+            if response.status_code != 200:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch daily attendance records")
+
+            records = response.json()
+            total = 0
+            content_range = response.headers.get("Content-Range") or response.headers.get("content-range")
+            if content_range:
+                try:
+                    total = int(content_range.split("/")[-1])
+                except (ValueError, IndexError):
+                    total = len(records)
+            else:
+                total = len(records)
+
+            return {"total": total, "page": page, "records": records}
+
+        except httpx.RequestError as e:
+            logger.error(f"Error fetching daily attendance: {str(e)}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Attendance service unavailable")
+
+    @staticmethod
     def get_employee_attendance(employee_id: str) -> List[Dict[str, Any]]:
         url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_records"
         params = {"employee_id": f"eq.{employee_id}", "order": "attendance_date.desc"}
