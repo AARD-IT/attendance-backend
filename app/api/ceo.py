@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.middleware.auth import require_ceo
 from app.schemas.dashboard import DashboardResponse
 from app.services.dashboard_service import dashboard_service
+from app.services.automation_settings_service import automation_settings_service
 from app.services.ceo_dashboard_settings_service import ceo_dashboard_settings_service
 from app.services.email_preferences_service import email_preferences_service
 from app.services.email_reports_service import email_reports_service
@@ -94,6 +95,16 @@ def get_dashboard_settings(current_user: Profile = Depends(require_ceo)):
 @router.put("/dashboard-settings", status_code=status.HTTP_200_OK)
 def update_dashboard_settings(payload: dict, current_user: Profile = Depends(require_ceo)):
     return ceo_dashboard_settings_service.upsert_settings(payload)
+
+
+@router.get("/automation-settings", status_code=status.HTTP_200_OK)
+def get_automation_settings(current_user: Profile = Depends(require_ceo)):
+    return automation_settings_service.get_settings()
+
+
+@router.put("/automation-settings", status_code=status.HTTP_200_OK)
+def update_automation_settings(payload: dict, current_user: Profile = Depends(require_ceo)):
+    return automation_settings_service.upsert_settings(payload)
 
 
 @router.get("/email-preferences", status_code=status.HTTP_200_OK)

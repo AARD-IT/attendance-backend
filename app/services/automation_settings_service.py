@@ -53,5 +53,35 @@ class AutomationSettingsService:
             return {**DEFAULT_SETTINGS, **rows[0]}
         return dict(DEFAULT_SETTINGS)
 
+    def upsert_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        current = self.get_settings()
+        body = {
+            "monthly_report_enabled": payload.get("monthly_report_enabled", current.get("monthly_report_enabled", False)),
+            "monthly_report_day": payload.get("monthly_report_day", current.get("monthly_report_day", 5)),
+            "monthly_report_time": payload.get("monthly_report_time", current.get("monthly_report_time", "09:00")),
+            "late_login_enabled": payload.get("late_login_enabled", current.get("late_login_enabled", False)),
+            "late_login_delay": payload.get("late_login_delay", current.get("late_login_delay", "same_day")),
+            "late_login_time": payload.get("late_login_time", current.get("late_login_time", "18:00")),
+            "early_logout_enabled": payload.get("early_logout_enabled", current.get("early_logout_enabled", False)),
+            "early_logout_delay": payload.get("early_logout_delay", current.get("early_logout_delay", "same_day")),
+            "early_logout_time": payload.get("early_logout_time", current.get("early_logout_time", "22:30")),
+        }
+
+        if current.get("id"):
+            with httpx.Client(timeout=10.0) as client:
+                response = client.patch(
+                    f"{self._table_url()}?id=eq.{current['id']}",
+                    headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "return=representation"},
+                    json=body,
+                )
+        else:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(self._table_url(), headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "return=representation"}, json=body)
+
+        rows = self._safe_json(response, fallback=[])
+        if isinstance(rows, list) and rows:
+            return {**DEFAULT_SETTINGS, **rows[0]}
+        return {**DEFAULT_SETTINGS, **current, **body}
+
 
 automation_settings_service = AutomationSettingsService()

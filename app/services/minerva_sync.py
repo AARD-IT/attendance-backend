@@ -5,10 +5,11 @@ Handles syncing employee and attendance data from Minerva to Supabase.
 
 import logging
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 
 from fastapi import HTTPException
 from app.core.config import settings
+from app.services.attendance_shift_engine import AttendanceShiftEngine
 from app.services.minerva_client import MinervaClient
 from app.db.supabase import SupabaseClient
 import uuid
@@ -153,8 +154,9 @@ class MinervaSyncService:
             normalized = normalized.replace(microsecond=0)
             return normalized.isoformat(timespec="seconds").replace('+00:00', ''), today.isoformat()
 
-        current_month = today.month
-        current_year = today.year
+        start_date = today - timedelta(days=7)
+        end_date = today
+        return start_date.isoformat(), end_date.isoformat()
 
         previous_month = current_month - 1
         previous_month_year = current_year
@@ -399,6 +401,29 @@ class MinervaSyncService:
             logger.warning("Unable to persist Minerva sync state: %s", exc)
             return {"success": False, "error": str(exc)}
 
+    @staticmethod
+    def _sync_state_is_active(sync_state: Optional[Dict[str, Any]], max_age_minutes: int = 45) -> bool:
+        if not sync_state:
+            return False
+
+        status = str(sync_state.get("status") or "").upper()
+        if status not in {"RUNNING", "LOCKED"}:
+            return False
+
+        updated_at = sync_state.get("updated_at") or sync_state.get("last_sync_at")
+        if not updated_at:
+            return False
+
+        try:
+            parsed = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
+        return age <= timedelta(minutes=max_age_minutes)
+
     def sync_attendance(self) -> Dict[str, Any]:
         """
         Sync attendance data from Minerva to Supabase attendance_records.
@@ -406,10 +431,12 @@ class MinervaSyncService:
         Returns:
             Dict with sync statistics (inserted, updated, skipped, errors)
         """
-        logger.info("Starting attendance sync from Minerva")
+        logger.info("===== ATTENDANCE SYNC START =====")
         start_time = datetime.utcnow()
         
         stats = {
+            "success": True,
+            "partial_sync": False,
             "fetched": 0,
             "inserted": 0,
             "updated": 0,
@@ -420,6 +447,7 @@ class MinervaSyncService:
 
         try:
             last_sync = self.get_last_sync_state()
+            logger.info("Last sync state=%s", last_sync)
             last_sync_timestamp = None
             if last_sync and last_sync.get("last_sync_at"):
                 try:
@@ -428,23 +456,59 @@ class MinervaSyncService:
                     logger.warning("Ignoring invalid last_sync_at value: %s", last_sync.get("last_sync_at"))
 
             start_date, end_date = self._build_sync_window(last_sync_timestamp=last_sync_timestamp)
-            logger.info("Attendance sync window start_date=%s end_date=%s last_sync=%s", start_date, end_date, last_sync_timestamp)
-            minerva_data = self.minerva_client.get_transactions(start_date=start_date, end_date=end_date)
+            logger.info("Incremental sync window start=%s end=%s", start_date, end_date)
+            logger.info("SYNC WINDOW start=%s end=%s", start_date, end_date)
+            logger.info(
+                "ATTENDANCE RANGE start=%s end=%s",
+                start_date,
+                end_date,
+            )
+            logger.info(
+                "ATTENDANCE SYNC START start_date=%s end_date=%s last_sync=%s",
+                start_date,
+                end_date,
+                last_sync_timestamp
+            )
+            logger.info("BEFORE CALL self.minerva_client.get_transactions")
+            minerva_data = self.minerva_client.get_transactions(
+                start_date=start_date,
+                end_date=end_date
+            )
+            logger.info("AFTER CALL self.minerva_client.get_transactions")
+            logger.info("TRANSACTIONS RECEIVED count=%s", len(minerva_data.get('data', []) if isinstance(minerva_data, dict) else minerva_data))
             transactions = minerva_data.get('data', []) if isinstance(minerva_data, dict) else minerva_data
+            logger.info(
+                "TRANSACTIONS RECEIVED count=%s",
+                len(transactions) if isinstance(transactions, list) else "NOT_A_LIST"
+            )
             
             if not isinstance(transactions, list):
                 logger.error(f"Invalid transactions data format from Minerva: {type(transactions)}")
                 stats["errors"] += 1
+                stats["success"] = False
                 stats["error_details"].append("Invalid transactions data format from Minerva")
+                self.save_sync_state(records_synced=0, status="FAILED")
                 return stats
 
+            stats["partial_sync"] = getattr(self.minerva_client, "partial_fetch", False)
+            if stats["partial_sync"] and len(transactions) > 0:
+                stats["success"] = True
+                stats["error_details"].append("Partial attendance sync due to skipped Minerva pages")
+
             stats["fetched"] = len(transactions)
+            logger.info("START GROUPING")
             logger.info(f"Fetched {len(transactions)} transactions from Minerva")
 
             # Group transactions by emp_code and date for efficient processing
             transactions_by_employee_date: Dict[Tuple[str, str], List[Dict]] = {}
             
-            for transaction in transactions:
+            for index, transaction in enumerate(transactions, start=1):
+                if index % 100 == 0:
+                    logger.info(
+                        "PROCESSING TRANSACTION %s/%s",
+                        index,
+                        len(transactions),
+                    )
                 try:
                     emp_code = str(transaction.get('emp_code', '')).strip()
                     punch_time_str = transaction.get('punch_time', '')
@@ -478,8 +542,17 @@ class MinervaSyncService:
                     logger.error(f"Error processing transaction: {str(e)}", exc_info=e)
                     stats["skipped"] += 1
 
+            logger.info("GROUPING COMPLETE groups=%s", len(transactions_by_employee_date))
+            logger.info("START BUILDING ATTENDANCE RECORDS")
+
             # Process grouped transactions
-            for (emp_code, attendance_date), day_transactions in transactions_by_employee_date.items():
+            for index, ((emp_code, attendance_date), day_transactions) in enumerate(transactions_by_employee_date.items(), start=1):
+                if index % 100 == 0:
+                    logger.info(
+                        "PROCESSING TRANSACTION GROUP %s/%s",
+                        index,
+                        len(transactions_by_employee_date),
+                    )
                 try:
                     sorted_transactions = sorted(day_transactions, key=lambda item: item['punch_time'])
                     logger.info(
@@ -505,6 +578,7 @@ class MinervaSyncService:
                         continue
 
                     employee_id = profile["id"]
+                    employee_name = str(profile.get("full_name") or f"{profile.get('first_name') or ''} {profile.get('last_name') or ''}".strip() or emp_code)
 
                     # Compute first and last punch strictly from sorted punch_time values.
                     first_punch = sorted_transactions[0]['punch_time']
@@ -516,6 +590,14 @@ class MinervaSyncService:
 
                     # Determine status
                     status = self._determine_attendance_status(total_hours)
+                    classification = AttendanceShiftEngine.classify_record({
+                        "employee_id": employee_id,
+                        "employee_name": employee_name,
+                        "attendance_date": attendance_date,
+                        "first_punch": first_punch.astimezone().isoformat(),
+                        "last_punch": last_punch.astimezone().isoformat(),
+                        "total_hours": total_hours,
+                    })
 
                     # Use the earliest transaction ID as reference metadata only.
                     minerva_transaction_id = str(sorted_transactions[0]['transaction'].get('id', '')).strip()
@@ -527,11 +609,17 @@ class MinervaSyncService:
 
                     result = self._store_daily_attendance(
                         employee_id=employee_id,
+                        employee_name=employee_name,
                         attendance_date=attendance_date,
+                        first_in=first_punch.astimezone().isoformat(),
+                        last_out=last_punch.astimezone().isoformat(),
                         first_punch=first_punch.astimezone().isoformat(),
                         last_punch=last_punch.astimezone().isoformat(),
                         working_hours=total_hours,
                         attendance_status=status,
+                        shift=classification.get("shift_type") or "Shift 1",
+                        late_login_flag=bool(classification.get("is_late")),
+                        early_logout_flag=bool(classification.get("is_early_out")),
                     )
 
                     fallback_result = self._insert_attendance_record(
@@ -575,16 +663,29 @@ class MinervaSyncService:
                     stats["errors"] += 1
                     stats["error_details"].append(f"Transaction group error: {str(e)}")
 
+            logger.info("ATTENDANCE RECORDS BUILT count=%s", len(transactions_by_employee_date))
+            logger.info("START UPSERT")
             execution_time = (datetime.utcnow() - start_time).total_seconds()
             stats["execution_time_seconds"] = execution_time
-            stats["last_sync_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace('+00:00', 'Z')
-            self.save_sync_state(records_synced=stats.get("inserted", 0) + stats.get("updated", 0), status="OK" if stats.get("errors", 0) == 0 else "WARN")
+            stats["partial_sync"] = getattr(self.minerva_client, "partial_fetch", False)
+            if stats["partial_sync"] and stats.get("inserted", 0) + stats.get("updated", 0) > 0:
+                stats["success"] = True
+            else:
+                stats["success"] = stats.get("errors", 0) == 0
+
+            self.save_sync_state(
+                records_synced=stats.get("inserted", 0) + stats.get("updated", 0),
+                status="SUCCESS" if stats.get("errors", 0) == 0 and not stats["partial_sync"] else "FAILED"
+            )
+            logger.info("UPSERT COMPLETE")
+            logger.info("START STATISTICS GENERATION")
             logger.info(f"Attendance sync completed in {execution_time:.2f}s - Stats: {stats}")
 
         except Exception as e:
             logger.error(f"Attendance sync failed: {str(e)}", exc_info=e)
             stats["errors"] += 1
             stats["error_details"].append(f"Attendance sync failed: {str(e)}")
+            self.save_sync_state(records_synced=0, status="FAILED")
 
         return stats
 
@@ -597,6 +698,30 @@ class MinervaSyncService:
         """
         logger.info("Starting complete Minerva sync")
         start_time = datetime.utcnow()
+
+        active_state = self.get_last_sync_state()
+        if self._sync_state_is_active(active_state):
+            logger.info("Skipping sync_all because a previous run is still active: %s", active_state)
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "sync_in_progress",
+                "employees_synced": 0,
+                "employees_inserted": 0,
+                "employees_updated": 0,
+                "employees_skipped": 0,
+                "employees_errors": 0,
+                "attendance_synced": 0,
+                "attendance_inserted": 0,
+                "attendance_updated": 0,
+                "attendance_skipped": 0,
+                "attendance_errors": 0,
+                "total_execution_time_seconds": 0,
+                "employee_stats": {},
+                "attendance_stats": {},
+            }
+
+        self.save_sync_state(records_synced=0, status="RUNNING")
 
         employee_stats = self.sync_employees()
         attendance_stats = self.sync_attendance()

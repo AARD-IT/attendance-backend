@@ -177,6 +177,23 @@ class TestMinervaSyncService:
                                 assert stats["attendance_skipped"] == 0
                                 assert "total_execution_time_seconds" in stats
 
+    def test_sync_all_skips_when_previous_run_is_active(self, sync_service):
+        """Test that overlapping sync runs are skipped when a run is already active."""
+        active_state = {
+            "status": "RUNNING",
+            "updated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        }
+
+        with patch.object(sync_service, 'get_last_sync_state', return_value=active_state):
+            with patch.object(sync_service, 'sync_employees') as sync_employees:
+                with patch.object(sync_service, 'sync_attendance') as sync_attendance:
+                    stats = sync_service.sync_all()
+
+        assert stats["skipped"] is True
+        assert stats["reason"] == "sync_in_progress"
+        sync_employees.assert_not_called()
+        sync_attendance.assert_not_called()
+
     def test_sync_attendance_skips_unmapped_employee(self, sync_service):
         """Test that attendance sync skips records when no employee profile exists."""
         transactions = {
@@ -200,6 +217,17 @@ class TestMinervaSyncService:
                 assert stats["updated"] == 0
                 assert stats["skipped"] == 1
                 assert stats["errors"] == 0
+
+    def test_sync_attendance_records_failed_state_on_invalid_transactions(self, sync_service):
+        """Test that invalid transaction payloads persist a failed sync state."""
+        with patch.object(sync_service.minerva_client, 'get_transactions', return_value={"data": {}}):
+            with patch.object(sync_service, 'save_sync_state', return_value={"success": False}):
+                stats = sync_service.sync_attendance()
+
+                assert stats["errors"] == 1
+                assert stats["inserted"] == 0
+                assert stats["updated"] == 0
+                sync_service.save_sync_state.assert_called_once_with(records_synced=0, status="FAILED")
 
     def test_sync_handles_missing_data_gracefully(self, sync_service):
         """Test that sync handles missing required fields gracefully."""
@@ -282,18 +310,18 @@ class TestMinervaSyncService:
                         assert stats["skipped"] == 0
                         assert stats["errors"] == 0
 
-    def test_build_sync_window_uses_previous_and_current_month(self, sync_service):
-        """Sync should default to the current month plus the previous month."""
+    def test_build_sync_window_uses_last_7_days_if_no_last_sync(self, sync_service):
+        """Sync should default to the past 7 days when no last sync exists."""
         start_date, end_date = sync_service._build_sync_window(date(2026, 6, 9))
 
-        assert start_date == "2026-05-01"
+        assert start_date == "2026-06-02"
         assert end_date == "2026-06-09"
 
-    def test_build_sync_window_wraps_january_to_previous_year(self, sync_service):
-        """The window should roll backward across year boundaries safely."""
+    def test_build_sync_window_wraps_year_boundary_using_last_7_days(self, sync_service):
+        """The window should use the previous 7 days across year boundaries."""
         start_date, end_date = sync_service._build_sync_window(date(2027, 1, 10))
 
-        assert start_date == "2026-12-01"
+        assert start_date == "2027-01-03"
         assert end_date == "2027-01-10"
 
     def test_build_sync_window_uses_last_sync_timestamp_for_incremental_sync(self, sync_service):
@@ -318,6 +346,73 @@ class TestMinervaSyncService:
             client.get_transactions(start_date="2026-05-01", end_date="2026-06-10")
 
         assert mock_get.call_args.kwargs["params"] == {"start_date": "2026-05-01", "end_date": "2026-06-10"}
+
+    def test_build_sync_window_uses_last_7_days_if_no_last_sync(self, sync_service):
+        """Sync should default to the past 7 days when no last sync exists."""
+        start_date, end_date = sync_service._build_sync_window(date(2026, 6, 15))
+
+        assert start_date == "2026-06-08"
+        assert end_date == "2026-06-15"
+
+    def test_fetch_paginated_retries_and_skips_failed_page(self):
+        """Minerva pagination should retry transient page failures and return collected records."""
+        client = MinervaClient()
+
+        first_response = MagicMock(status_code=200)
+        first_response.json.return_value = {"data": [{"id": "TXN001"}], "next": "https://api.next/page/2"}
+        second_response = MagicMock(status_code=502)
+        third_response = MagicMock(status_code=502)
+        fourth_response = MagicMock(status_code=502)
+        fifth_response = MagicMock(status_code=502)
+
+        with patch("app.services.minerva_client.requests.get", side_effect=[first_response, second_response, third_response, fourth_response, fifth_response]) as mock_get:
+            result = client.get_transactions(start_date="2026-06-08", end_date="2026-06-15")
+
+        assert result == [{"id": "TXN001"}]
+        assert client.partial_fetch is True
+        assert mock_get.call_count == 5
+        assert mock_get.call_args_list[0].kwargs["params"] == {"start_date": "2026-06-08", "end_date": "2026-06-15"}
+
+    def test_sync_attendance_returns_partial_success_if_some_pages_fail(self, sync_service):
+        """Attendance sync should return partial success when some pages failed after collecting records."""
+        transactions = [
+            {
+                "id": "TXN001",
+                "emp_code": "EMP001",
+                "punch_time": "2026-06-10T09:00:00Z",
+                "terminal": "Terminal1",
+                "verify_type": "Face",
+            }
+        ]
+
+        with patch.object(sync_service.minerva_client, 'get_transactions', return_value=transactions):
+            with patch.object(sync_service, '_get_profile_by_emp_code', return_value={"id": "user-123"}):
+                with patch.object(sync_service, '_get_attendance_record', return_value=None):
+                    with patch.object(sync_service, '_insert_attendance_record', return_value={"success": True}):
+                        with patch.object(sync_service, 'save_sync_state', return_value={"success": True}) as save_state:
+                            sync_service.minerva_client.partial_fetch = True
+                            stats = sync_service.sync_attendance()
+
+        assert stats["success"] is True
+        assert stats["partial_sync"] is True
+        save_state.assert_called_once_with(records_synced=1, status="FAILED")
+
+    def test_upsert_sync_state_does_not_update_last_sync_at_on_failed(self):
+        """Supabase sync state upsert should not set last_sync_at for failed syncs."""
+        fake_client = MagicMock()
+        fake_response = MagicMock(status_code=200)
+        fake_response.json.return_value = [{"id": "global", "status": "FAILED"}]
+        fake_client.__enter__.return_value.post.return_value = fake_response
+
+        with patch("app.db.supabase.httpx.Client", return_value=fake_client):
+            SupabaseClient.upsert_sync_state(records_synced=0, status="FAILED")
+
+        sent_payload = fake_client.__enter__.return_value.post.call_args.kwargs["json"]
+        assert sent_payload["id"] == "global"
+        assert sent_payload["records_synced"] == 0
+        assert sent_payload["status"] == "FAILED"
+        assert "last_sync_at" not in sent_payload
+        assert "updated_at" in sent_payload
 
     def test_compute_day_punch_bounds_uses_true_min_and_max(self, sync_service):
         """Test that day-level bounds come from min/max punch_time, not list position."""

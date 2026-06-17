@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     # Resend Configuration
     RESEND_API_KEY: str = ""
     RESEND_FROM_EMAIL: str = ""
+
+    # Scheduled job protection (optional; leave empty to allow unauthenticated job calls)
+    SCHEDULED_JOB_TOKEN: str = ""
     
     # Minerva Attendance API Configuration
     MINERVA_BASE_URL: str

@@ -1,6 +1,7 @@
 """Minerva Attendance API client using token authentication."""
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -22,6 +23,7 @@ class MinervaClient:
         }
         self.employee_endpoint = settings.MINERVA_EMPLOYEE_ENDPOINT
         self.transaction_endpoint = settings.MINERVA_TRANSACTION_ENDPOINT
+        self.partial_fetch = False
 
     def _fetch_paginated(self, url: str, label: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch all pages of a paginated Minerva endpoint, optionally filtered by date range."""
@@ -31,15 +33,75 @@ class MinervaClient:
         params = {key: value for key, value in {"start_date": start_date, "end_date": end_date}.items() if value}
 
         running_total = 0
+        self.partial_fetch = False
+        retry_statuses = {500, 502, 503, 504}
+        max_retries = 3
 
         while current_url:
-            try:
-                response = requests.get(current_url, headers=self.headers, timeout=180, params=params if page_number == 1 else None)
-                response.raise_for_status()
-                payload = response.json()
-            except RequestException as exc:
-                logger.error("Minerva %s fetch failed on page %s: %s", label, page_number, exc)
-                raise
+            attempt = 0
+            response = None
+
+            while True:
+                try:
+                    response = requests.get(
+                        current_url,
+                        headers=self.headers,
+                        timeout=180,
+                        params=params if page_number == 1 else None,
+                    )
+
+                    if response.status_code in retry_statuses:
+                        if attempt < max_retries:
+                            attempt += 1
+                            logger.warning(
+                                "Minerva %s fetch returned status %s on page %s, retrying %s/%s",
+                                label,
+                                response.status_code,
+                                page_number,
+                                attempt,
+                                max_retries,
+                            )
+                            time.sleep(2)
+                            continue
+
+                        logger.warning("Skipping failed page %s", page_number)
+                        self.partial_fetch = len(all_items) > 0
+                        current_url = None
+                        break
+
+                    response.raise_for_status()
+                    payload = response.json()
+                    break
+
+                except RequestException as exc:
+                    status_code = getattr(response, "status_code", None)
+                    if status_code in retry_statuses and attempt < max_retries:
+                        attempt += 1
+                        logger.warning(
+                            "Minerva %s fetch returned status %s on page %s, retrying %s/%s",
+                            label,
+                            status_code,
+                            page_number,
+                            attempt,
+                            max_retries,
+                        )
+                        time.sleep(2)
+                        continue
+
+                    if status_code in retry_statuses:
+                        logger.warning("Skipping failed page %s", page_number)
+                        self.partial_fetch = len(all_items) > 0
+                        current_url = None
+                        break
+
+                    logger.error("Minerva %s fetch failed on page %s: %s", label, page_number, exc)
+                    raise
+
+            if current_url is None and response is None and not all_items:
+                return []
+
+            if current_url is None and all_items:
+                break
 
             if isinstance(payload, dict):
                 records = payload.get("data") or []
@@ -52,6 +114,7 @@ class MinervaClient:
                 records = []
 
             running_total += len(records)
+            logger.info("Transactions page=%s records=%s total=%s", page_number, len(records), running_total)
             logger.info(
                 "Minerva pagination audit label=%s page=%s records_on_page=%d running_total=%d next=%s",
                 label,

@@ -161,8 +161,8 @@ class AutomationEmailService:
     def _preference_mode(self, preferences: List[Dict[str, Any]], employee_id: str, mode_name: str) -> str:
         for row in preferences:
             if str(row.get("employee_id") or "") == str(employee_id):
-                return str(row.get(mode_name) or "manual").lower()
-        return "manual"
+                return str(row.get(mode_name) or "auto").lower()
+        return "auto"
 
     def _attendance_record_is_complete(self, record: Dict[str, Any] | None) -> bool:
         return bool(record and record.get("first_punch") and record.get("last_punch"))
@@ -180,14 +180,6 @@ class AutomationEmailService:
 
     def _send_if_enabled(self, employee_id: str, employee_name: str, recipient_email: str, email_type: str, attendance_date: str) -> Dict[str, Any] | None:
         if not recipient_email:
-            return None
-        preferences = email_preferences_service.list_preferences()
-        mode = self._preference_mode(preferences, employee_id, {
-            "monthly_report": "monthly_report_mode",
-            "late_login_alert": "late_login_mode",
-            "early_logout_alert": "early_logout_mode",
-        }.get(email_type, "late_login_mode"))
-        if mode != "auto":
             return None
         if not self.should_send_alert(employee_id, attendance_date, email_type):
             return {"status": "skipped", "reason": "duplicate"}
@@ -280,25 +272,77 @@ class AutomationEmailService:
     def process_due_jobs(self) -> Dict[str, Any]:
         settings_payload = automation_settings_service.get_settings()
         now = datetime.now()
-        today = now.date().isoformat()
         results = {"processed": False, "monthly_report": 0, "late_login_alert": 0, "early_logout_alert": 0}
 
-        if bool(settings_payload.get("monthly_report_enabled")) and now.day == int(settings_payload.get("monthly_report_day", 5)) and now.strftime("%H:%M") >= str(settings_payload.get("monthly_report_time", "09:00")):
-            target_month = self._previous_completed_month_label(now)
-            results["monthly_report"] = len(self.send_monthly_reports(target_month))
+        monthly_result = self.run_monthly_report_job(now=now, settings_payload=settings_payload)
+        if monthly_result.get("processed"):
+            results["monthly_report"] = int(monthly_result.get("count", 0))
             results["processed"] = True
 
-        if bool(settings_payload.get("late_login_enabled")) and now.strftime("%H:%M") >= str(settings_payload.get("late_login_time", "18:00")):
-            target_date = self._delivery_target_date(now, settings_payload.get("late_login_delay"))
-            results["late_login_alert"] = len(self.send_late_login_alerts(target_date))
+        late_result = self.run_late_login_job(now=now, settings_payload=settings_payload)
+        if late_result.get("processed"):
+            results["late_login_alert"] = int(late_result.get("count", 0))
             results["processed"] = True
 
-        if bool(settings_payload.get("early_logout_enabled")) and now.strftime("%H:%M") >= str(settings_payload.get("early_logout_time", "22:30")):
-            target_date = self._delivery_target_date(now, settings_payload.get("early_logout_delay"))
-            results["early_logout_alert"] = len(self.send_early_logout_alerts(target_date))
+        early_result = self.run_early_logout_job(now=now, settings_payload=settings_payload)
+        if early_result.get("processed"):
+            results["early_logout_alert"] = int(early_result.get("count", 0))
             results["processed"] = True
 
         return results
+
+    def run_monthly_report_job(self, now: datetime | None = None, settings_payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        now = now or datetime.now()
+        settings_payload = settings_payload or automation_settings_service.get_settings()
+        if not bool(settings_payload.get("monthly_report_enabled")):
+            return {"processed": False, "reason": "disabled", "count": 0}
+        if now.day != int(settings_payload.get("monthly_report_day", 5)):
+            return {"processed": False, "reason": "not_scheduled_day", "count": 0}
+        if now.strftime("%H:%M") < str(settings_payload.get("monthly_report_time", "09:00")):
+            return {"processed": False, "reason": "not_due_yet", "count": 0}
+
+        try:
+            target_month = self._previous_completed_month_label(now)
+            sent = self.send_monthly_reports(target_month)
+            logger.info("Monthly report job completed count=%s target_month=%s", len(sent), target_month)
+            return {"processed": True, "count": len(sent), "target_month": target_month}
+        except Exception as exc:
+            logger.warning("Monthly report job failed: %s", exc)
+            return {"processed": False, "reason": str(exc), "count": 0}
+
+    def run_late_login_job(self, now: datetime | None = None, settings_payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        now = now or datetime.now()
+        settings_payload = settings_payload or automation_settings_service.get_settings()
+        if not bool(settings_payload.get("late_login_enabled")):
+            return {"processed": False, "reason": "disabled", "count": 0}
+        if now.strftime("%H:%M") < str(settings_payload.get("late_login_time", "18:00")):
+            return {"processed": False, "reason": "not_due_yet", "count": 0}
+
+        try:
+            target_date = self._delivery_target_date(now, settings_payload.get("late_login_delay"))
+            sent = self.send_late_login_alerts(target_date)
+            logger.info("Late login job completed count=%s target_date=%s", len(sent), target_date)
+            return {"processed": True, "count": len(sent), "target_date": target_date}
+        except Exception as exc:
+            logger.warning("Late login job failed: %s", exc)
+            return {"processed": False, "reason": str(exc), "count": 0}
+
+    def run_early_logout_job(self, now: datetime | None = None, settings_payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        now = now or datetime.now()
+        settings_payload = settings_payload or automation_settings_service.get_settings()
+        if not bool(settings_payload.get("early_logout_enabled")):
+            return {"processed": False, "reason": "disabled", "count": 0}
+        if now.strftime("%H:%M") < str(settings_payload.get("early_logout_time", "22:30")):
+            return {"processed": False, "reason": "not_due_yet", "count": 0}
+
+        try:
+            target_date = self._delivery_target_date(now, settings_payload.get("early_logout_delay"))
+            sent = self.send_early_logout_alerts(target_date)
+            logger.info("Early logout job completed count=%s target_date=%s", len(sent), target_date)
+            return {"processed": True, "count": len(sent), "target_date": target_date}
+        except Exception as exc:
+            logger.warning("Early logout job failed: %s", exc)
+            return {"processed": False, "reason": str(exc), "count": 0}
 
 
 automation_email_service = AutomationEmailService()

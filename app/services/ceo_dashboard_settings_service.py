@@ -53,11 +53,10 @@ class CEODashboardSettingsService:
         return dict(DEFAULT_SETTINGS)
 
     def get_all_settings(self) -> list[Dict[str, Any]]:
-        params = {"select": "*"}
-        with httpx.Client(timeout=10.0) as client:
-            response = client.get(self._table_url(), headers=SUPABASE_HEADERS_SERVICE, params=params)
-        rows = self._safe_json(response, fallback=[])
-        return rows if isinstance(rows, list) else []
+        settings_row = self.get_settings()
+        if settings_row:
+            return [settings_row]
+        return [dict(DEFAULT_SETTINGS)]
 
     def upsert_settings(self, payload: Dict[str, Any], user_id: str | None = None) -> Dict[str, Any]:
         body = {

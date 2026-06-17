@@ -74,19 +74,18 @@ class DashboardAnalyticsService:
                     return [
                         {
                             **row,
+                            "first_punch": row.get("first_punch") or row.get("first_in"),
+                            "last_punch": row.get("last_punch") or row.get("last_out"),
                             "total_hours": row.get("working_hours") if row.get("working_hours") is not None else row.get("total_hours", 0),
                             "status": row.get("attendance_status") if row.get("attendance_status") is not None else row.get("status", "ABSENT"),
+                            "shift_name": row.get("shift") or row.get("shift_name") or row.get("shift_type"),
+                            "shift_type": row.get("shift") or row.get("shift_type") or row.get("shift_name"),
+                            "late_login_flag": row.get("late_login_flag"),
+                            "early_logout_flag": row.get("early_logout_flag"),
                         }
                         for row in rows
                     ]
                 return rows
-
-            if table == "attendance_records":
-                fallback_url = f"{settings.SUPABASE_URL.rstrip('/')}/rest/v1/attendance_records"
-                with httpx.Client(timeout=10.0) as client:
-                    fallback_response = client.get(fallback_url, headers=HEADERS)
-                if fallback_response.status_code == 200:
-                    return fallback_response.json()
 
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch {table}")
         except httpx.RequestError as exc:

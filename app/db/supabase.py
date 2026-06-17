@@ -559,10 +559,12 @@ class SupabaseClient:
         url = f"{settings.SUPABASE_URL}/rest/v1/minerva_sync_state"
         data = {
             "id": "global",
-            "last_sync_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
             "records_synced": records_synced,
             "status": status,
+            "updated_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        if status not in {"FAILED", "RUNNING", "LOCKED"}:
+            data["last_sync_at"] = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
         try:
             with httpx.Client(timeout=10.0) as client:
                 response = client.post(
@@ -606,21 +608,33 @@ class SupabaseClient:
     @staticmethod
     def upsert_daily_attendance_record(
         employee_id: str,
+        employee_name: Optional[str],
         attendance_date: str,
+        first_in: Optional[str],
+        last_out: Optional[str],
         first_punch: str,
         last_punch: str,
         working_hours: float,
         attendance_status: str,
+        shift: Optional[str] = None,
+        late_login_flag: Optional[bool] = None,
+        early_logout_flag: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Upsert the normalized first/last-punch attendance record for analytics."""
         url = f"{settings.SUPABASE_URL}/rest/v1/attendance_daily"
         data = {
             "employee_id": employee_id,
+            "employee_name": employee_name,
             "attendance_date": attendance_date,
+            "first_in": first_in or first_punch,
+            "last_out": last_out or last_punch,
             "first_punch": first_punch,
             "last_punch": last_punch,
             "working_hours": working_hours,
             "attendance_status": attendance_status,
+            "shift": shift,
+            "late_login_flag": late_login_flag,
+            "early_logout_flag": early_logout_flag,
         }
         try:
             with httpx.Client(timeout=10.0) as client:

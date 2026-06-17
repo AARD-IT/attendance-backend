@@ -12,10 +12,10 @@ from app.api.ceo import router as ceo_router
 from app.api.employee import router as employee_router
 from app.api.attendance import router as attendance_router
 from app.api.minerva import router as minerva_router
+from app.api.automation import router as automation_router
 from app.api.minerva_sync import router as minerva_sync_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.core.config import settings
-from app.services.automation_scheduler import automation_scheduler
 
 
 # Create FastAPI application
@@ -27,16 +27,6 @@ app = FastAPI(
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json"
 )
-
-@app.on_event("startup")
-def startup_event():
-    automation_scheduler.start()
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    automation_scheduler.stop()
-
 
 # Add CORS middleware
 app.add_middleware(
@@ -91,6 +81,7 @@ app.include_router(ceo_router)
 app.include_router(employee_router)
 app.include_router(attendance_router)
 app.include_router(minerva_router)
+app.include_router(automation_router)
 app.include_router(minerva_sync_router)
 app.include_router(dashboard_router)
 

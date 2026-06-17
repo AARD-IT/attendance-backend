@@ -50,7 +50,7 @@ class AttendanceService:
                 date_filters.append(f"lte.{end_date}")
             params["attendance_date"] = date_filters
 
-        url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_records"
+        url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_daily"
 
         try:
             with httpx.Client(timeout=10.0) as client:
@@ -108,9 +108,21 @@ class AttendanceService:
                 )
 
             if response.status_code != 200:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch daily attendance records")
+                logger.warning(
+                    "Failed to fetch daily attendance records from Supabase: status=%s body=%s",
+                    response.status_code,
+                    (response.text or '')[:500],
+                )
+                fallback_url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_records"
+                with httpx.Client(timeout=10.0) as client:
+                    fallback_response = client.get(fallback_url, headers=AttendanceService.SUPABASE_HEADERS, params=params)
+                if fallback_response.status_code == 200:
+                    records = fallback_response.json()
+                    return {"total": len(records), "page": page, "records": records}
+                return {"total": 0, "page": page, "records": []}
 
             records = response.json()
+
             total = 0
             content_range = response.headers.get("Content-Range") or response.headers.get("content-range")
             if content_range:
@@ -125,11 +137,11 @@ class AttendanceService:
 
         except httpx.RequestError as e:
             logger.error(f"Error fetching daily attendance: {str(e)}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Attendance service unavailable")
+            return {"total": 0, "page": page, "records": []}
 
     @staticmethod
     def get_employee_attendance(employee_id: str) -> List[Dict[str, Any]]:
-        url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_records"
+        url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_daily"
         params = {"employee_id": f"eq.{employee_id}", "order": "attendance_date.desc"}
 
         try:
@@ -147,7 +159,7 @@ class AttendanceService:
     def get_attendance_summary() -> Dict[str, Any]:
         # compute stats for today
         today = date.today().isoformat()
-        url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_records"
+        url = f"{AttendanceService.SUPABASE_BASE}/rest/v1/attendance_daily"
 
         try:
             with httpx.Client(timeout=10.0) as client:
@@ -157,10 +169,13 @@ class AttendanceService:
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch attendance summary")
 
             rows = resp.json()
-            present = sum(1 for r in rows if r.get("status") == "PRESENT")
-            absent = sum(1 for r in rows if r.get("status") == "ABSENT")
-            half = sum(1 for r in rows if r.get("status") == "HALF_DAY")
-            leave = sum(1 for r in rows if r.get("status") == "LEAVE")
+            def _status(row: Dict[str, Any]) -> str:
+                return str(row.get("attendance_status") or row.get("status") or "").upper()
+
+            present = sum(1 for r in rows if _status(r) == "PRESENT")
+            absent = sum(1 for r in rows if _status(r) == "ABSENT")
+            half = sum(1 for r in rows if _status(r) == "HALF_DAY")
+            leave = sum(1 for r in rows if _status(r) == "LEAVE")
 
             # total employees: only Minerva-synced employee master profiles should count
             with httpx.Client(timeout=10.0) as client:
