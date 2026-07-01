@@ -48,6 +48,7 @@ class Settings(BaseSettings):
 
     # Scheduled job protection (optional; leave empty to allow unauthenticated job calls)
     SCHEDULED_JOB_TOKEN: str = ""
+    MINERVA_SYNC_MAX_WORKERS: int = 4
     
     # Minerva Attendance API Configuration
     MINERVA_BASE_URL: str

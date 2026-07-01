@@ -69,12 +69,12 @@ def list_shift_assignments(current_user: Profile = Depends(require_ceo)):
 def create_shift_assignment(payload: dict, current_user: Profile = Depends(require_ceo)):
     if not payload.get("employee_id"):
         raise HTTPException(status_code=400, detail="employee_id is required")
-    return shift_assignment_service.create_assignment(payload)
+    return shift_assignment_service.create_assignment(payload, assigned_by=str(current_user.id))
 
 
 @router.put("/shift-assignments/{assignment_id}", status_code=status.HTTP_200_OK)
 def update_shift_assignment(assignment_id: str, payload: dict, current_user: Profile = Depends(require_ceo)):
-    return shift_assignment_service.update_assignment(assignment_id, payload)
+    return shift_assignment_service.update_assignment(assignment_id, payload, assigned_by=str(current_user.id))
 
 
 @router.delete("/shift-assignments/{assignment_id}", status_code=status.HTTP_200_OK)

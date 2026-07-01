@@ -15,8 +15,16 @@ from app.api.minerva import router as minerva_router
 from app.api.automation import router as automation_router
 from app.api.minerva_sync import router as minerva_sync_router
 from app.api.routes.dashboard import router as dashboard_router
+from app.api.shifts import router as shifts_router
+from contextlib import asynccontextmanager
+from app.services.automation_scheduler import automation_scheduler
 from app.core.config import settings
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    automation_scheduler.start()
+    yield
+    automation_scheduler.stop()
 
 # Create FastAPI application
 app = FastAPI(
@@ -25,7 +33,8 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json"
+    openapi_url="/api/openapi.json",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
@@ -84,6 +93,7 @@ app.include_router(minerva_router)
 app.include_router(automation_router)
 app.include_router(minerva_sync_router)
 app.include_router(dashboard_router)
+app.include_router(shifts_router)
 
 
 # Global exception handlers

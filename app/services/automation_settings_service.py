@@ -17,12 +17,22 @@ DEFAULT_SETTINGS = {
     "monthly_report_enabled": False,
     "monthly_report_day": 5,
     "monthly_report_time": "09:00",
+    "monthly_report_cc_enabled": False,
     "late_login_enabled": False,
     "late_login_delay": "same_day",
     "late_login_time": "18:00",
+    "late_login_send_immediately": True,
+    "late_login_delay_minutes": 0,
     "early_logout_enabled": False,
     "early_logout_delay": "same_day",
     "early_logout_time": "22:30",
+    "early_logout_delay_minutes": 0,
+    "missing_punch_enabled": False,
+    "missing_punch_delay_minutes": 60,
+    "escalation_enabled": False,
+    "escalation_late_threshold": 5,
+    "escalation_deviation_threshold": 5,
+    "escalation_recipients": "",
 }
 
 
@@ -55,17 +65,16 @@ class AutomationSettingsService:
 
     def upsert_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         current = self.get_settings()
-        body = {
-            "monthly_report_enabled": payload.get("monthly_report_enabled", current.get("monthly_report_enabled", False)),
-            "monthly_report_day": payload.get("monthly_report_day", current.get("monthly_report_day", 5)),
-            "monthly_report_time": payload.get("monthly_report_time", current.get("monthly_report_time", "09:00")),
-            "late_login_enabled": payload.get("late_login_enabled", current.get("late_login_enabled", False)),
-            "late_login_delay": payload.get("late_login_delay", current.get("late_login_delay", "same_day")),
-            "late_login_time": payload.get("late_login_time", current.get("late_login_time", "18:00")),
-            "early_logout_enabled": payload.get("early_logout_enabled", current.get("early_logout_enabled", False)),
-            "early_logout_delay": payload.get("early_logout_delay", current.get("early_logout_delay", "same_day")),
-            "early_logout_time": payload.get("early_logout_time", current.get("early_logout_time", "22:30")),
-        }
+        body = {key: payload.get(key, current.get(key, DEFAULT_SETTINGS.get(key))) for key in DEFAULT_SETTINGS}
+        for optional_key in (
+            "monthly_report_template_id",
+            "late_login_template_id",
+            "early_logout_template_id",
+            "missing_punch_template_id",
+            "escalation_template_id",
+        ):
+            if optional_key in payload:
+                body[optional_key] = payload[optional_key]
 
         if current.get("id"):
             with httpx.Client(timeout=10.0) as client:

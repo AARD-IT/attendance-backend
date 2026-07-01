@@ -183,6 +183,33 @@ class AutomationEmailService:
             return None
         if not self.should_send_alert(employee_id, attendance_date, email_type):
             return {"status": "skipped", "reason": "duplicate"}
+
+        # Check employee-level communication settings (preferences)
+        try:
+            prefs = email_preferences_service.get_preference(employee_id)
+        except Exception as p_exc:
+            logger.warning("Failed to load employee preferences for %s: %s", employee_id, p_exc)
+            prefs = None
+
+        if email_type == "monthly_report":
+            mode = (prefs or {}).get("monthly_report_mode") or "manual"
+            if mode != "auto":
+                logger.info("Skipping monthly report for %s: employee preference is not auto", employee_id)
+                return {"status": "skipped", "reason": "employee_preference_manual"}
+        elif email_type == "late_login_alert":
+            mode = (prefs or {}).get("late_login_mode") or "manual"
+            if mode != "auto":
+                logger.info("Skipping late login alert for %s: employee preference is not auto", employee_id)
+                return {"status": "skipped", "reason": "employee_preference_manual"}
+        elif email_type == "early_logout_alert":
+            mode = (prefs or {}).get("early_logout_mode") or "manual"
+            if mode != "auto":
+                logger.info("Skipping early logout alert for %s: employee preference is not auto", employee_id)
+                return {"status": "skipped", "reason": "employee_preference_manual"}
+
+        # Resolve dynamic email and CC email from active shift assignment
+        recipient_email, cc_email = email_reports_service.resolve_employee_emails(employee_id, recipient_email)
+
         try:
             record = self._fetch_normalized_record(employee_id, attendance_date)
             if email_type in {"late_login_alert", "early_logout_alert"} and not self._attendance_record_is_complete(record):
@@ -200,34 +227,33 @@ class AutomationEmailService:
                 "year": year,
                 "month_label": f"{datetime(year, month, 1).strftime('%B %Y')}" if month and year else None,
             }
-            message_id = email_reports_service.send_email(
-                recipient_email=str(recipient_email),
-                subject=email_reports_service._subject_for(email_type, context),
-                email_body=email_reports_service._body_for(employee_name, email_type, context),
-                email_type=email_type,
-                employee_name=str(employee_name or "Employee"),
-            )
             return email_reports_service.log_activity(
                 employee_id=str(employee_id),
                 employee_name=str(employee_name or "Employee"),
-                recipient_email=str(recipient_email),
+                recipient_email=str(recipient_email or ""),
+                cc_email=str(cc_email or ""),
                 email_type=email_type,
                 status="SENT",
-                provider_message_id=message_id,
-                skip_send=True,
+                skip_send=False,
+                context=context,
+                source="AUTOMATION",
             )
         except Exception as exc:
-            email_reports_service.log_activity(
-                employee_id=str(employee_id),
-                employee_name=str(employee_name or "Employee"),
-                recipient_email=str(recipient_email),
-                email_type=email_type,
-                status="FAILED",
-                provider="resend",
-                provider_message_id=None,
-                skip_send=True,
-            )
-            raise RuntimeError(f"Resend email delivery failed: {exc}") from exc
+            logger.exception("Failed sending automated email for %s", employee_id)
+            try:
+                email_reports_service.log_activity(
+                    employee_id=str(employee_id),
+                    employee_name=str(employee_name or "Employee"),
+                    recipient_email=str(recipient_email or ""),
+                    cc_email=str(cc_email or ""),
+                    email_type=email_type,
+                    status="FAILED",
+                    skip_send=True,
+                    source="AUTOMATION",
+                )
+            except Exception:
+                pass
+            raise RuntimeError(f"Automated email delivery failed: {exc}") from exc
 
     def send_late_login_alerts(self, attendance_date: str | None = None) -> List[Dict[str, Any]]:
         target_date = attendance_date or date.today().isoformat()

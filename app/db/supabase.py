@@ -581,6 +581,176 @@ class SupabaseClient:
             return {"success": False, "error": str(exc)}
 
     @staticmethod
+    def fetch_sync_status_latest() -> Optional[Dict[str, Any]]:
+        """Fetch the most recent Minerva sync status log from sync_status table."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/sync_status"
+        params = {"select": "*", "order": "created_at.desc", "limit": "1"}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url, headers=SUPABASE_HEADERS_SERVICE, params=params)
+            if response.status_code != 200:
+                return None
+            results = response.json()
+            return results[0] if isinstance(results, list) and results else None
+        except httpx.RequestError:
+            return None
+
+    @staticmethod
+    def fetch_last_successful_sync_time() -> Optional[datetime]:
+        """Fetch the timestamp of the last successful sync from sync_status table."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/sync_status"
+        params = {"select": "last_attempt", "status": "eq.SUCCESS", "order": "created_at.desc", "limit": "1"}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url, headers=SUPABASE_HEADERS_SERVICE, params=params)
+            if response.status_code != 200:
+                return None
+            results = response.json()
+            if isinstance(results, list) and results:
+                last_attempt_str = results[0].get("last_attempt")
+                if last_attempt_str:
+                    try:
+                        return datetime.fromisoformat(last_attempt_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+            return None
+        except httpx.RequestError:
+            return None
+
+    @staticmethod
+    def insert_sync_status(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert or upsert a sync status log record into sync_status table."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/sync_status"
+        params = {"on_conflict": "id"}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    url,
+                    json=data,
+                    params=params,
+                    headers={
+                        **SUPABASE_HEADERS_SERVICE,
+                        "Prefer": "resolution=merge-duplicates,return=representation"
+                    }
+                )
+            if response.status_code in (200, 201):
+                result = response.json()
+                return result[0] if isinstance(result, list) and result else data
+            return {"success": False, "error": response.text}
+        except httpx.RequestError as exc:
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def fetch_kpi_cache() -> Optional[Dict[str, Any]]:
+        """Fetch the cached dashboard KPIs snapshot."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/kpi_cache"
+        params = {"select": "*", "id": "eq.global", "limit": "1"}
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url, headers=SUPABASE_HEADERS_SERVICE, params=params)
+            if response.status_code != 200:
+                return None
+            results = response.json()
+            return results[0] if isinstance(results, list) and results else None
+        except httpx.RequestError:
+            return None
+
+    @staticmethod
+    def upsert_kpi_cache(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Upsert the cached dashboard KPIs snapshot."""
+        url = f"{settings.SUPABASE_URL}/rest/v1/kpi_cache"
+        payload = {
+            "id": "global",
+            **data,
+            "updated_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+        }
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    url,
+                    json=payload,
+                    params={"on_conflict": "id"},
+                    headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "resolution=merge-duplicates,return=representation"},
+                )
+            if response.status_code in (200, 201):
+                result = response.json()
+                return result[0] if isinstance(result, list) and result else payload
+            return {"success": False, "error": response.text}
+        except httpx.RequestError as exc:
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def upsert_attendance_records_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Batch upsert attendance records into attendance_records table."""
+        if not records:
+            return {"success": True, "count": 0}
+        url = f"{settings.SUPABASE_URL}/rest/v1/attendance_records"
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    url,
+                    json=records,
+                    params={"on_conflict": "employee_id,attendance_date"},
+                    headers={
+                        **SUPABASE_HEADERS_SERVICE,
+                        "Prefer": "resolution=merge-duplicates"
+                    }
+                )
+            if response.status_code in [200, 201, 204]:
+                return {"success": True, "count": len(records)}
+            return {"success": False, "error": response.text, "status_code": response.status_code}
+        except httpx.RequestError as exc:
+            logger.warning("Failed to batch upsert attendance records: %s", exc)
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def upsert_daily_attendance_records_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Batch upsert daily attendance records into attendance_daily table."""
+        if not records:
+            return {"success": True, "count": 0}
+        url = f"{settings.SUPABASE_URL}/rest/v1/attendance_daily"
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    url,
+                    json=records,
+                    params={"on_conflict": "employee_id,attendance_date"},
+                    headers={
+                        **SUPABASE_HEADERS_SERVICE,
+                        "Prefer": "resolution=merge-duplicates"
+                    }
+                )
+            if response.status_code in [200, 201, 204]:
+                return {"success": True, "count": len(records)}
+            return {"success": False, "error": response.text, "status_code": response.status_code}
+        except httpx.RequestError as exc:
+            logger.warning("Failed to batch upsert daily attendance records: %s", exc)
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
+    def upsert_minerva_raw_logs_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Batch upsert Minerva raw logs into minerva_raw_logs table."""
+        if not records:
+            return {"success": True, "count": 0}
+        url = f"{settings.SUPABASE_URL}/rest/v1/minerva_raw_logs"
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(
+                    url,
+                    json=records,
+                    headers={
+                        **SUPABASE_HEADERS_SERVICE,
+                        "Prefer": "resolution=merge-duplicates"
+                    }
+                )
+            if response.status_code in [200, 201, 204]:
+                return {"success": True, "count": len(records)}
+            return {"success": False, "error": response.text, "status_code": response.status_code}
+        except httpx.RequestError as exc:
+            logger.warning("Failed to batch upsert Minerva raw logs: %s", exc)
+            return {"success": False, "error": str(exc)}
+
+    @staticmethod
     def upsert_minerva_raw_log(transaction: Dict[str, Any]) -> Dict[str, Any]:
         """Store each Minerva punch event in the raw log table."""
         url = f"{settings.SUPABASE_URL}/rest/v1/minerva_raw_logs"

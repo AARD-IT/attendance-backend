@@ -111,59 +111,65 @@ def sync_attendance() -> Dict[str, Any]:
         )
 
 
+from fastapi import BackgroundTasks
+from app.db.supabase import SupabaseClient
+
 @router.post("/all", status_code=status.HTTP_200_OK)
-def sync_all() -> Dict[str, Any]:
+def sync_all(background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """
-    Run complete sync: employees first, then attendance.
-    
-    This endpoint orchestrates a full synchronization by:
-    1. Syncing all employees from Minerva
-    2. Syncing all attendance transactions from Minerva
-    
-    Returns:
-        Dict containing combined statistics:
-        - success: bool - Whether the entire sync was successful
-        - employees_synced: int - Number of employees synced
-        - attendance_synced: int - Number of attendance records synced
-        - total_execution_time_seconds: float - Total time taken
-        - employee_stats: Dict - Detailed employee sync statistics
-        - attendance_stats: Dict - Detailed attendance sync statistics
+    Trigger complete sync in the background (employees first, then attendance).
     """
-    logger.info("Received request to run complete sync (employees + attendance)")
+    logger.info("Received request to run background sync (employees + attendance)")
     
     try:
-        stats = get_minerva_sync_service().sync_all()
-        
+        latest = SupabaseClient.fetch_sync_status_latest()
+        if latest and latest.get("status") == "RUNNING":
+            return {
+                "success": True,
+                "message": "Synchronization is already running in the background.",
+                "status": "RUNNING"
+            }
+            
+        background_tasks.add_task(get_minerva_sync_service().sync_all_job)
         return {
-            "success": stats.get("success", False) and stats.get("employees_errors", 0) == 0 and stats.get("attendance_errors", 0) == 0,
-            "employees_synced": stats.get("employees_synced", 0),
-            "employees_inserted": stats.get("employees_inserted", 0),
-            "employees_updated": stats.get("employees_updated", 0),
-            "employees_errors": stats.get("employees_errors", 0),
-            "attendance_synced": stats.get("attendance_synced", 0),
-            "attendance_inserted": stats.get("attendance_inserted", 0),
-            "attendance_updated": stats.get("attendance_updated", 0),
-            "attendance_errors": stats.get("attendance_errors", 0),
-            "total_execution_time_seconds": stats.get("total_execution_time_seconds", 0),
-            "employee_stats": stats.get("employee_stats", {}),
-            "attendance_stats": stats.get("attendance_stats", {})
+            "success": True,
+            "message": "Synchronization started in the background...",
+            "status": "RUNNING"
         }
-    except RequestException as exc:
-        logger.error("Minerva complete sync failed", exc_info=exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Minerva API error: {str(exc)}"
-        )
     except Exception as exc:
-        logger.error("Complete sync service error", exc_info=exc)
+        logger.error("Failed to start background sync", exc_info=exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Sync service error: {str(exc)}"
+            detail=f"Failed to trigger sync: {str(exc)}"
         )
 
 
-# Convenience GET endpoints so the routes can be visited in a browser
-# or tested with simple GET requests (they delegate to the POST handlers).
+@router.get("/status", status_code=status.HTTP_200_OK)
+def get_sync_status() -> Dict[str, Any]:
+    """
+    Get the latest Minerva synchronization status details.
+    """
+    try:
+        latest = SupabaseClient.fetch_sync_status_latest()
+        if not latest:
+            return {
+                "status": "IDLE",
+                "last_successful_sync": None,
+                "last_attempt": None,
+                "records_processed": 0,
+                "duration_ms": 0,
+                "error_message": None
+            }
+        return latest
+    except Exception as exc:
+        logger.error("Failed to fetch sync status", exc_info=exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc)
+        )
+
+
+# Convenience GET endpoints delegates to background poster
 @router.get("/employees", status_code=status.HTTP_200_OK)
 def sync_employees_get() -> Dict[str, Any]:
     return sync_employees()
@@ -187,5 +193,5 @@ def debug_attendance(emp_code: str, attendance_date: str) -> Dict[str, Any]:
 
 
 @router.get("/all", status_code=status.HTTP_200_OK)
-def sync_all_get() -> Dict[str, Any]:
-    return sync_all()
+def sync_all_get(background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    return sync_all(background_tasks)

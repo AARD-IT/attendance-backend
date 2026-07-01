@@ -9,7 +9,7 @@ from fastapi import HTTPException, status
 
 from app.core.config import settings
 from app.services.attendance_shift_engine import AttendanceShiftEngine
-from app.services.shift_rules import get_shift_rule, minutes_since_midnight, normalize_shift_type
+from app.services.shift_rules import get_shift_rule, minutes_since_midnight, normalize_shift_type, resolve_shift_rule_from_assignment
 
 
 HEADERS = {
@@ -47,15 +47,26 @@ class DashboardAnalyticsService:
         attendance_date = str(record.get("attendance_date") or "")
         employee_id = str(record.get("employee_id") or "")
         employee_name = str(record.get("employee_name") or "") or None
+        if employee_id and not employee_name:
+            try:
+                profiles = DashboardAnalyticsService._fetch_records("profiles")
+                profile = DashboardAnalyticsService._profile_map(profiles).get(employee_id, {})
+                employee_name = str(profile.get("full_name") or "") or None
+            except Exception:
+                pass
         assignment = DashboardAnalyticsService._get_shift_assignment(employee_id, attendance_date, employee_name=employee_name) if employee_id else None
-        shift_type = normalize_shift_type((assignment or {}).get("shift_type") or "Shift 1")
-        rule = get_shift_rule(shift_type)
+        rule = resolve_shift_rule_from_assignment(assignment)
+        shift_type = normalize_shift_type(rule.get("shift_name") or rule.get("label") or "Shift 1")
+        login_cutoff_str = rule.get("login_cutoff", "10:35")
+        logout_cutoff_str = rule.get("logout_cutoff", "18:00")
         return {
-            "login_cutoff": minutes_since_midnight(rule.get("login_cutoff", "10:35")),
-            "logout_cutoff": minutes_since_midnight(rule.get("logout_cutoff", "18:00")),
-            "login_threshold": datetime.strptime(rule.get("login_cutoff", "10:35"), "%H:%M").time(),
-            "logout_threshold": datetime.strptime(rule.get("logout_cutoff", "18:00"), "%H:%M").time(),
+            "login_cutoff": minutes_since_midnight(login_cutoff_str),
+            "logout_cutoff": minutes_since_midnight(logout_cutoff_str),
+            "login_threshold": datetime.strptime(login_cutoff_str, "%H:%M").time(),
+            "logout_threshold": datetime.strptime(logout_cutoff_str, "%H:%M").time(),
             "shift_type": shift_type,
+            "shift_id": rule.get("id"),
+            "minimum_working_hours": float(rule.get("minimum_working_hours") or 8),
         }
 
     @staticmethod
@@ -224,6 +235,26 @@ class DashboardAnalyticsService:
 
     @staticmethod
     def get_summary(month: int | None = None, year: int | None = None) -> Dict[str, Any]:
+        from app.db.supabase import SupabaseClient
+        import logging
+        _log = logging.getLogger(__name__)
+
+        try:
+            cache = SupabaseClient.fetch_kpi_cache()
+            if cache:
+                _log.info("Returning cached KPI metrics for dashboard summary")
+                return {
+                    "total_employees": cache.get("total_employees") or 0,
+                    "present_today": cache.get("present_today") or 0,
+                    "absent_today": cache.get("absent_today") or 0,
+                    "late_arrivals": cache.get("late_arrivals") or 0,
+                    "half_day": 0,
+                    "leave": 0,
+                    "attendance_percentage": float(cache.get("attendance_percentage") or 0.0),
+                }
+        except Exception as e:
+            _log.warning("KPI cache fetch failed, falling back to database query: %s", e)
+
         profiles = DashboardAnalyticsService._fetch_records("profiles")
         records = DashboardAnalyticsService._fetch_records("attendance_records")
 
@@ -404,7 +435,18 @@ class DashboardAnalyticsService:
 
         month_records = DashboardAnalyticsService._filter_records_for_month(records, month=month, year=year)
 
-        unique_employee_ids = sorted({str(record.get("employee_id")) for record in month_records if record.get("employee_id")})
+        employee_profiles = [
+            profile for profile in profiles
+            if DashboardAnalyticsService._is_minerva_employee(profile)
+        ]
+        if not employee_profiles:
+            employee_profiles = profiles
+
+        if employee_profiles:
+            unique_employee_ids = sorted({str(p.get("id")) for p in employee_profiles if p.get("id")})
+        else:
+            unique_employee_ids = sorted({str(record.get("employee_id")) for record in month_records if record.get("employee_id")})
+
         rows = [
             DashboardAnalyticsService._monthly_employee_summary(employee_id, records, profile_map, month, year)
             for employee_id in unique_employee_ids

@@ -15,7 +15,7 @@ from app.services.attendance_service import attendance_service
 from app.services.attendance_shift_engine import AttendanceShiftEngine
 from app.services.dashboard_analytics_service import analytics_service
 from app.services.shift_assignment_service import shift_assignment_service
-from app.services.shift_rules import get_shift_rule, normalize_shift_type
+from app.services.shift_rules import get_shift_rule, normalize_shift_type, resolve_shift_rule_from_assignment
 
 logger = logging.getLogger(__name__)
 
@@ -117,20 +117,29 @@ class EmailReportsService:
     def _resolve_shift_timings(record: Dict[str, Any], assignment: Dict[str, Any] | None = None, classification: Dict[str, Any] | None = None) -> Dict[str, Any]:
         assignment = assignment or {}
         classification = classification or {}
-        shift_source = (
-            assignment.get("shift_type")
-            or assignment.get("shift_name")
-            or record.get("shift_type")
-            or record.get("shift_name")
-            or classification.get("shift_type")
-            or "Shift 1"
-        )
-        rule = get_shift_rule(normalize_shift_type(str(shift_source)))
+        if assignment.get("shift_id") or assignment.get("shift_type") or assignment.get("shift_name"):
+            rule = resolve_shift_rule_from_assignment(assignment)
+        else:
+            shift_source = (
+                record.get("shift_type")
+                or record.get("shift_name")
+                or classification.get("shift_type")
+            )
+            rule = get_shift_rule(normalize_shift_type(str(shift_source or "")))
         return {
-            "shift_name": str(assignment.get("shift_name") or assignment.get("shift_type") or record.get("shift_name") or record.get("shift_type") or shift_source or "Assigned Shift"),
-            "shift_type": normalize_shift_type(str(shift_source)),
-            "login_cutoff": str(rule.get("login_cutoff") or assignment.get("login_cutoff") or classification.get("login_cutoff") or "10:35"),
-            "logout_cutoff": str(rule.get("logout_cutoff") or assignment.get("logout_cutoff") or classification.get("logout_cutoff") or "18:00"),
+            "shift_name": str(
+                assignment.get("shift_name")
+                or assignment.get("shift_type")
+                or rule.get("shift_name")
+                or record.get("shift_name")
+                or record.get("shift_type")
+                or "Assigned Shift"
+            ),
+            "shift_type": normalize_shift_type(str(rule.get("shift_name") or rule.get("label") or "Shift 1")),
+            "login_cutoff": str(rule.get("login_cutoff") or classification.get("login_cutoff") or "10:35"),
+            "logout_cutoff": str(rule.get("logout_cutoff") or classification.get("logout_cutoff") or "18:00"),
+            "allowed_login_time": str(rule.get("allowed_login_time") or rule.get("login_cutoff") or "10:35"),
+            "minimum_logout_time": str(rule.get("minimum_logout_time") or rule.get("logout_cutoff") or "18:00"),
         }
 
     @staticmethod
@@ -468,16 +477,63 @@ class EmailReportsService:
 
         raise RuntimeError(f"Supabase request failed for {action}: status={response.status_code}, body={body_text[:500]}")
 
-    def list_logs(self) -> list[Dict[str, Any]]:
+    def list_logs(
+        self,
+        *,
+        employee_id: str | None = None,
+        email_type: str | None = None,
+        source: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> list[Dict[str, Any]]:
+        params: Dict[str, str] = {"select": "*", "order": "sent_at.desc"}
+        if employee_id:
+            params["employee_id"] = f"eq.{employee_id}"
+        if email_type:
+            params["email_type"] = f"eq.{email_type}"
+        if source:
+            params["source"] = f"eq.{source.upper()}"
+        if from_date:
+            params["sent_at"] = f"gte.{from_date}"
+        if to_date:
+            params["and"] = f"(sent_at.lte.{to_date})"
+
         with httpx.Client(timeout=10.0) as client:
             response = client.get(
                 self._table_url(),
                 headers=SUPABASE_HEADERS_SERVICE,
-                params={"select": "*", "order": "sent_at.desc"},
+                params=params,
             )
 
         rows = self._safe_json(response, action="list_logs", fallback=[])
-        return rows if isinstance(rows, list) else []
+        if not isinstance(rows, list):
+            return []
+        if from_date or to_date:
+            filtered = []
+            for row in rows:
+                sent_at = str(row.get("sent_at") or row.get("created_at") or "")
+                if from_date and sent_at and sent_at[:10] < from_date:
+                    continue
+                if to_date and sent_at and sent_at[:10] > to_date:
+                    continue
+                filtered.append(row)
+            return filtered
+        return rows
+
+    @staticmethod
+    def resolve_employee_emails(employee_id: str, fallback_email: str, fallback_cc: str = "") -> tuple[str, str]:
+        if not employee_id:
+            return fallback_email, fallback_cc
+        try:
+            assignments = shift_assignment_service.get_assignments(employee_id=employee_id, active_only=True)
+            if assignments:
+                assignment = assignments[0]
+                email = str(assignment.get("employee_email") or "").strip()
+                cc = str(assignment.get("cc_email") or "").strip()
+                return email or fallback_email, cc or fallback_cc
+        except Exception as exc:
+            logger.warning("Failed to resolve dynamic emails: %s", exc)
+        return fallback_email, fallback_cc
 
     def log_activity(
         self,
@@ -490,7 +546,16 @@ class EmailReportsService:
         provider_message_id: str | None = None,
         skip_send: bool = False,
         context: Dict[str, Any] | None = None,
+        *,
+        cc_email: str = "",
+        source: str = "AUTOMATION",
+        sent_by: str | None = None,
+        force: bool = False,
     ) -> Dict[str, Any]:
+        # force=True bypasses monthly deduplication (used for manual sends)
+        # Resolve email and cc_email dynamically from active shift assignment
+        recipient_email, cc_email = EmailReportsService.resolve_employee_emails(employee_id, recipient_email, cc_email)
+
         normalized_status = str(status or "sent").strip().lower()
         if normalized_status not in {"sent", "failed", "pending"}:
             normalized_status = "sent"
@@ -521,7 +586,8 @@ class EmailReportsService:
         email_body = self._body_for(employee_name, email_type, context)
 
         log_id: str | None = None
-        if str(email_type).lower() == "monthly_report" and not skip_send:
+        existing_log: Dict[str, Any] | None = None
+        if str(email_type).lower() == "monthly_report" and not skip_send and not force:
             existing_log = self._find_existing_monthly_report(employee_id, subject)
             if existing_log and str(existing_log.get("status") or "").lower() in {"sent", "pending"}:
                 return existing_log
@@ -551,6 +617,8 @@ class EmailReportsService:
                 attachments = None
                 ceo_email = self._fetch_ceo_email()
                 cc_recipients = [ceo_email] if ceo_email else None
+                if cc_email and str(cc_email).strip().lower() != "none":
+                    cc_recipients = (cc_recipients or []) + [item.strip() for item in str(cc_email).split(",") if item.strip() and item.strip().lower() != "none"]
                 if str(email_type).lower() == "monthly_report":
                     filename, csv_bytes = self._build_csv_attachment(str(context.get("employee_id") or employee_id), month=context.get("month"), year=context.get("year"))
                     attachments = [{"filename": filename, "content": base64.b64encode(csv_bytes).decode("ascii")}]
@@ -584,7 +652,7 @@ class EmailReportsService:
             "employee_id": employee_id,
             "employee_name": employee_name,
             "employee_email": recipient_email or None,
-            "cc_email": None,
+            "cc_email": cc_email or None,
             "email_type": email_type,
             "subject": subject,
             "email_body": email_body,
@@ -592,6 +660,9 @@ class EmailReportsService:
             "provider": provider,
             "provider_message_id": provider_message_id,
             "sent_at": "now()",
+            "source": str(source or "AUTOMATION").upper(),
+            "sent_by": sent_by,
+            "delivery_status": normalized_status,
         }
 
         if log_id and str(email_type).lower() == "monthly_report":

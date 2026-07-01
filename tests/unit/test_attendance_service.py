@@ -53,6 +53,7 @@ def test_get_attendance_summary(monkeypatch):
     def fake_client_factory(timeout=10.0):
         # first call returns attendance_rows, second returns profiles
         responses = {
+            f"{base.SUPABASE_BASE}/rest/v1/attendance_daily": DummyResp(attendance_rows, 200),
             f"{base.SUPABASE_BASE}/rest/v1/attendance_records": DummyResp(attendance_rows, 200),
             f"{base.SUPABASE_BASE}/rest/v1/profiles": DummyResp(profiles, 200),
         }
