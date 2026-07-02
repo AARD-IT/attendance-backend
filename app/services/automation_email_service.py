@@ -256,115 +256,412 @@ class AutomationEmailService:
             raise RuntimeError(f"Automated email delivery failed: {exc}") from exc
 
     def send_late_login_alerts(self, attendance_date: str | None = None) -> List[Dict[str, Any]]:
+        from app.services.dashboard_analytics_service import DashboardAnalyticsService
         target_date = attendance_date or date.today().isoformat()
-        records = attendance_service.get_daily_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
-        if not records:
-            records = attendance_service.get_all_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
+        
+        # Tracking logs
+        eligible_count = 0
+        sent_count = 0
+        skipped_count = 0
+        skip_reasons = {}
+        
+        year = int(target_date[:4])
+        month = int(target_date[5:7])
+        
+        try:
+            all_records = DashboardAnalyticsService._fetch_records("attendance_records")
+            records = [r for r in all_records if str(r.get("attendance_date", "")) == target_date]
+        except Exception as exc:
+            import traceback
+            # Bug 5 requirement: Log Employee ID, Month, Year, Date Range, SQL/API Query, HTTP Status, Full Exception, Stack Trace
+            logger.error(
+                "Attendance fetch failed for Late Logins:\n"
+                "Employee ID: ALL\n"
+                "Month: %s\n"
+                "Year: %s\n"
+                "Date Range: %s\n"
+                "SQL/API Query: GET %s/rest/v1/attendance_daily\n"
+                "HTTP Status: Unknown\n"
+                "Full Exception: %s\n"
+                "Stack Trace:\n%s",
+                month, year, target_date, settings.SUPABASE_URL, str(exc), traceback.format_exc()
+            )
+            raise
+
         sent = []
+        eligible_count = len(records)
+
         for record in records:
-            if not self._attendance_record_is_complete(record):
-                continue
-            classification = AttendanceShiftEngine.classify_record(record)
-            if not classification.get("is_late"):
-                continue
             employee_id = str(record.get("employee_id") or "")
             employee_name = str(record.get("employee_name") or "Employee")
-            recipient_email = str(record.get("employee_email") or record.get("recipient_email") or "")
-            activity = self._send_if_enabled(employee_id, employee_name, recipient_email, "late_login_alert", target_date)
-            if activity:
-                sent.append(activity)
+            
+            # Bug 7: Recipient and CC emails resolved directly from Shift Management
+            recipient_email, cc_email = email_reports_service.resolve_employee_emails(employee_id, "", "")
+            
+            if not self._attendance_record_is_complete(record):
+                skipped_count += 1
+                skip_reasons["Incomplete Record"] = skip_reasons.get("Incomplete Record", 0) + 1
+                continue
+                
+            classification = AttendanceShiftEngine.classify_record(record)
+            if not classification.get("is_late"):
+                skipped_count += 1
+                skip_reasons["Not Late"] = skip_reasons.get("Not Late", 0) + 1
+                continue
+                
+            try:
+                prefs = email_preferences_service.get_preference(employee_id)
+            except Exception as p_exc:
+                logger.warning("Failed to load employee preferences for %s: %s", employee_id, p_exc)
+                prefs = None
+
+            mode = (prefs or {}).get("late_login_mode") or "manual"
+            if mode != "auto":
+                skipped_count += 1
+                skip_reasons["Preference Manual"] = skip_reasons.get("Preference Manual", 0) + 1
+                continue
+                
+            if not recipient_email:
+                skipped_count += 1
+                skip_reasons["Email Missing"] = skip_reasons.get("Email Missing", 0) + 1
+                continue
+                
+            if not self.should_send_alert(employee_id, target_date, "late_login_alert"):
+                skipped_count += 1
+                skip_reasons["Already Sent"] = skip_reasons.get("Already Sent", 0) + 1
+                continue
+                
+            try:
+                activity = self._send_if_enabled(employee_id, employee_name, recipient_email, "late_login_alert", target_date)
+                if activity:
+                    sent.append(activity)
+                    sent_count += 1
+            except Exception as send_exc:
+                logger.error("Failed to send late login alert to %s: %s", employee_id, send_exc)
+                skipped_count += 1
+                skip_reasons[f"Error: {str(send_exc)}"] = skip_reasons.get(f"Error: {str(send_exc)}", 0) + 1
+                
+        logger.info(
+            "Late Login Automation Execution Summary | Eligible Employees: %s | Employees Sent: %s | Employees Skipped: %s | Reasons: %s",
+            eligible_count, sent_count, skipped_count, json.dumps(skip_reasons)
+        )
         return sent
 
     def send_early_logout_alerts(self, attendance_date: str | None = None) -> List[Dict[str, Any]]:
+        from app.services.dashboard_analytics_service import DashboardAnalyticsService
         target_date = attendance_date or date.today().isoformat()
-        records = attendance_service.get_daily_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
-        if not records:
-            records = attendance_service.get_all_attendance(limit=1000, start_date=target_date, end_date=target_date).get("records", [])
+        
+        # Tracking logs
+        eligible_count = 0
+        sent_count = 0
+        skipped_count = 0
+        skip_reasons = {}
+        
+        year = int(target_date[:4])
+        month = int(target_date[5:7])
+        
+        try:
+            all_records = DashboardAnalyticsService._fetch_records("attendance_records")
+            records = [r for r in all_records if str(r.get("attendance_date", "")) == target_date]
+        except Exception as exc:
+            import traceback
+            logger.error(
+                "Attendance fetch failed for Early Logouts:\n"
+                "Employee ID: ALL\n"
+                "Month: %s\n"
+                "Year: %s\n"
+                "Date Range: %s\n"
+                "SQL/API Query: GET %s/rest/v1/attendance_daily\n"
+                "HTTP Status: Unknown\n"
+                "Full Exception: %s\n"
+                "Stack Trace:\n%s",
+                month, year, target_date, settings.SUPABASE_URL, str(exc), traceback.format_exc()
+            )
+            raise
+
         sent = []
+        eligible_count = len(records)
+
         for record in records:
-            if not self._attendance_record_is_complete(record):
-                continue
-            classification = AttendanceShiftEngine.classify_record(record)
-            if not classification.get("is_early_out"):
-                continue
             employee_id = str(record.get("employee_id") or "")
             employee_name = str(record.get("employee_name") or "Employee")
-            recipient_email = str(record.get("employee_email") or record.get("recipient_email") or "")
-            activity = self._send_if_enabled(employee_id, employee_name, recipient_email, "early_logout_alert", target_date)
-            if activity:
-                sent.append(activity)
+            
+            # Bug 7: Recipient and CC emails resolved directly from Shift Management
+            recipient_email, cc_email = email_reports_service.resolve_employee_emails(employee_id, "", "")
+            
+            if not self._attendance_record_is_complete(record):
+                skipped_count += 1
+                skip_reasons["Incomplete Record"] = skip_reasons.get("Incomplete Record", 0) + 1
+                continue
+                
+            classification = AttendanceShiftEngine.classify_record(record)
+            if not classification.get("is_early_out"):
+                skipped_count += 1
+                skip_reasons["Not Early Out"] = skip_reasons.get("Not Early Out", 0) + 1
+                continue
+                
+            try:
+                prefs = email_preferences_service.get_preference(employee_id)
+            except Exception as p_exc:
+                logger.warning("Failed to load employee preferences for %s: %s", employee_id, p_exc)
+                prefs = None
+
+            mode = (prefs or {}).get("early_logout_mode") or "manual"
+            if mode != "auto":
+                skipped_count += 1
+                skip_reasons["Preference Manual"] = skip_reasons.get("Preference Manual", 0) + 1
+                continue
+                
+            if not recipient_email:
+                skipped_count += 1
+                skip_reasons["Email Missing"] = skip_reasons.get("Email Missing", 0) + 1
+                continue
+                
+            if not self.should_send_alert(employee_id, target_date, "early_logout_alert"):
+                skipped_count += 1
+                skip_reasons["Already Sent"] = skip_reasons.get("Already Sent", 0) + 1
+                continue
+                
+            try:
+                activity = self._send_if_enabled(employee_id, employee_name, recipient_email, "early_logout_alert", target_date)
+                if activity:
+                    sent.append(activity)
+                    sent_count += 1
+            except Exception as send_exc:
+                logger.error("Failed to send early logout alert to %s: %s", employee_id, send_exc)
+                skipped_count += 1
+                skip_reasons[f"Error: {str(send_exc)}"] = skip_reasons.get(f"Error: {str(send_exc)}", 0) + 1
+                
+        logger.info(
+            "Early Logout Automation Execution Summary | Eligible Employees: %s | Employees Sent: %s | Employees Skipped: %s | Reasons: %s",
+            eligible_count, sent_count, skipped_count, json.dumps(skip_reasons)
+        )
         return sent
 
     def process_due_jobs(self) -> Dict[str, Any]:
-        settings_payload = automation_settings_service.get_settings()
-        now = datetime.now()
+        from zoneinfo import ZoneInfo
+        kolkata_tz = ZoneInfo("Asia/Kolkata")
+        now = datetime.now(kolkata_tz)
+        
+        logger.info("Scheduler Started | Current Time: %s", now.strftime("%Y-%m-%d %H:%M:%S %Z"))
+        
+        try:
+            settings_payload = automation_settings_service.get_settings()
+        except Exception as exc:
+            logger.error("Failed to load automation settings: %s", exc)
+            settings_payload = {}
+
         results = {"processed": False, "monthly_report": 0, "late_login_alert": 0, "early_logout_alert": 0}
 
-        monthly_result = self.run_monthly_report_job(now=now, settings_payload=settings_payload)
-        if monthly_result.get("processed"):
-            results["monthly_report"] = int(monthly_result.get("count", 0))
-            results["processed"] = True
+        # Independent execution block: Monthly reports
+        try:
+            monthly_result = self.run_monthly_report_job(now=now, settings_payload=settings_payload)
+            if monthly_result.get("processed"):
+                results["monthly_report"] = int(monthly_result.get("count", 0))
+                results["processed"] = True
+        except Exception as exc:
+            logger.error("Monthly report runner failed: %s", exc)
 
-        late_result = self.run_late_login_job(now=now, settings_payload=settings_payload)
-        if late_result.get("processed"):
-            results["late_login_alert"] = int(late_result.get("count", 0))
-            results["processed"] = True
+        # Independent execution block: Late logins
+        try:
+            late_result = self.run_late_login_job(now=now, settings_payload=settings_payload)
+            if late_result.get("processed"):
+                results["late_login_alert"] = int(late_result.get("count", 0))
+                results["processed"] = True
+        except Exception as exc:
+            logger.error("Late login runner failed: %s", exc)
 
-        early_result = self.run_early_logout_job(now=now, settings_payload=settings_payload)
-        if early_result.get("processed"):
-            results["early_logout_alert"] = int(early_result.get("count", 0))
-            results["processed"] = True
+        # Independent execution block: Early logouts
+        try:
+            early_result = self.run_early_logout_job(now=now, settings_payload=settings_payload)
+            if early_result.get("processed"):
+                results["early_logout_alert"] = int(early_result.get("count", 0))
+                results["processed"] = True
+        except Exception as exc:
+            logger.error("Early logout runner failed: %s", exc)
 
         return results
 
     def run_monthly_report_job(self, now: datetime | None = None, settings_payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        now = now or datetime.now()
+        from zoneinfo import ZoneInfo
+        kolkata_tz = ZoneInfo("Asia/Kolkata")
+        now = now or datetime.now(kolkata_tz)
         settings_payload = settings_payload or automation_settings_service.get_settings()
-        if not bool(settings_payload.get("monthly_report_enabled")):
+        
+        enabled = bool(settings_payload.get("monthly_report_enabled"))
+        current_day = now.day
+        gen_day = int(settings_payload.get("monthly_report_day", 5))
+        current_time = now.strftime("%H:%M")
+        del_time = str(settings_payload.get("monthly_report_time", "09:00"))
+        
+        logger.info(
+            "Monthly Automation Check | Enabled: %s | Current Day: %s | Generation Day: %s | Current Time: %s | Delivery Time: %s",
+            enabled, current_day, gen_day, current_time, del_time
+        )
+        
+        if not enabled:
+            logger.info("Monthly Automation Skipped: Disabled")
             return {"processed": False, "reason": "disabled", "count": 0}
-        if now.day != int(settings_payload.get("monthly_report_day", 5)):
+        if current_day != gen_day:
+            logger.info("Monthly Automation Skipped: Wrong Generation Day")
             return {"processed": False, "reason": "not_scheduled_day", "count": 0}
-        if now.strftime("%H:%M") < str(settings_payload.get("monthly_report_time", "09:00")):
+        if current_time < del_time:
+            logger.info("Monthly Automation Skipped: Wrong Delivery Time (not due yet)")
             return {"processed": False, "reason": "not_due_yet", "count": 0}
 
         try:
             target_month = self._previous_completed_month_label(now)
+            execution_date = now.date().isoformat()
+            
+            try:
+                url_exec = f"{settings.SUPABASE_URL}/rest/v1/automation_job_executions"
+                headers_exec = {
+                    "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+                }
+                params_exec = {
+                    "job_type": "eq.monthly_report",
+                    "execution_date": f"eq.{execution_date}",
+                    "status": "in.(SUCCESS,SKIPPED)"
+                }
+                resp_exec = httpx.get(url_exec, headers=headers_exec, params=params_exec)
+                if resp_exec.status_code == 200 and resp_exec.json():
+                    logger.info("Monthly Automation Skipped: Already executed today")
+                    return {"processed": False, "reason": "already_executed_today", "count": 0}
+            except Exception as e_exec:
+                logger.warning("Failed to check job execution log: %s", e_exec)
+
+            from app.services.automation_job_log_service import automation_job_log_service
+            claimed = automation_job_log_service.claim_job("monthly_report", execution_date)
+            if not claimed:
+                logger.info("Monthly Automation Skipped: Already claimed/running")
+                return {"processed": False, "reason": "already_claimed", "count": 0}
+                
             sent = self.send_monthly_reports(target_month)
             logger.info("Monthly report job completed count=%s target_month=%s", len(sent), target_month)
+            
+            status_val = "SUCCESS" if sent else "SKIPPED"
+            automation_job_log_service.finalize_job("monthly_report", execution_date, status_val, details={"count": len(sent)})
             return {"processed": True, "count": len(sent), "target_month": target_month}
         except Exception as exc:
             logger.warning("Monthly report job failed: %s", exc)
             return {"processed": False, "reason": str(exc), "count": 0}
 
     def run_late_login_job(self, now: datetime | None = None, settings_payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        now = now or datetime.now()
+        from zoneinfo import ZoneInfo
+        kolkata_tz = ZoneInfo("Asia/Kolkata")
+        now = now or datetime.now(kolkata_tz)
         settings_payload = settings_payload or automation_settings_service.get_settings()
-        if not bool(settings_payload.get("late_login_enabled")):
+        
+        enabled = bool(settings_payload.get("late_login_enabled"))
+        current_time = now.strftime("%H:%M")
+        del_time = str(settings_payload.get("late_login_time", "18:00"))
+        
+        logger.info(
+            "Late Login Automation Check | Enabled: %s | Current Time: %s | Delivery Time: %s",
+            enabled, current_time, del_time
+        )
+        
+        if not enabled:
+            logger.info("Late Login Automation Skipped: Disabled")
             return {"processed": False, "reason": "disabled", "count": 0}
-        if now.strftime("%H:%M") < str(settings_payload.get("late_login_time", "18:00")):
+        if current_time < del_time:
+            logger.info("Late Login Automation Skipped: Wrong Delivery Time (not due yet)")
             return {"processed": False, "reason": "not_due_yet", "count": 0}
 
         try:
             target_date = self._delivery_target_date(now, settings_payload.get("late_login_delay"))
+            execution_date = now.date().isoformat()
+            
+            try:
+                url_exec = f"{settings.SUPABASE_URL}/rest/v1/automation_job_executions"
+                headers_exec = {
+                    "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+                }
+                params_exec = {
+                    "job_type": "eq.late_login",
+                    "execution_date": f"eq.{execution_date}",
+                    "status": "in.(SUCCESS,SKIPPED)"
+                }
+                resp_exec = httpx.get(url_exec, headers=headers_exec, params=params_exec)
+                if resp_exec.status_code == 200 and resp_exec.json():
+                    logger.info("Late Login Automation Skipped: Already executed today")
+                    return {"processed": False, "reason": "already_executed_today", "count": 0}
+            except Exception as e_exec:
+                logger.warning("Failed to check job execution log: %s", e_exec)
+                
+            from app.services.automation_job_log_service import automation_job_log_service
+            claimed = automation_job_log_service.claim_job("late_login", execution_date)
+            if not claimed:
+                logger.info("Late Login Automation Skipped: Already claimed/running")
+                return {"processed": False, "reason": "already_claimed", "count": 0}
+                
             sent = self.send_late_login_alerts(target_date)
             logger.info("Late login job completed count=%s target_date=%s", len(sent), target_date)
+            
+            status_val = "SUCCESS" if sent else "SKIPPED"
+            automation_job_log_service.finalize_job("late_login", execution_date, status_val, details={"count": len(sent)})
             return {"processed": True, "count": len(sent), "target_date": target_date}
         except Exception as exc:
             logger.warning("Late login job failed: %s", exc)
             return {"processed": False, "reason": str(exc), "count": 0}
 
     def run_early_logout_job(self, now: datetime | None = None, settings_payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        now = now or datetime.now()
+        from zoneinfo import ZoneInfo
+        kolkata_tz = ZoneInfo("Asia/Kolkata")
+        now = now or datetime.now(kolkata_tz)
         settings_payload = settings_payload or automation_settings_service.get_settings()
-        if not bool(settings_payload.get("early_logout_enabled")):
+        
+        enabled = bool(settings_payload.get("early_logout_enabled"))
+        current_time = now.strftime("%H:%M")
+        del_time = str(settings_payload.get("early_logout_time", "22:30"))
+        
+        logger.info(
+            "Early Logout Automation Check | Enabled: %s | Current Time: %s | Delivery Time: %s",
+            enabled, current_time, del_time
+        )
+        
+        if not enabled:
+            logger.info("Early Logout Automation Skipped: Disabled")
             return {"processed": False, "reason": "disabled", "count": 0}
-        if now.strftime("%H:%M") < str(settings_payload.get("early_logout_time", "22:30")):
+        if current_time < del_time:
+            logger.info("Early Logout Automation Skipped: Wrong Delivery Time (not due yet)")
             return {"processed": False, "reason": "not_due_yet", "count": 0}
 
         try:
             target_date = self._delivery_target_date(now, settings_payload.get("early_logout_delay"))
+            execution_date = now.date().isoformat()
+            
+            try:
+                url_exec = f"{settings.SUPABASE_URL}/rest/v1/automation_job_executions"
+                headers_exec = {
+                    "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+                }
+                params_exec = {
+                    "job_type": "eq.early_logout",
+                    "execution_date": f"eq.{execution_date}",
+                    "status": "in.(SUCCESS,SKIPPED)"
+                }
+                resp_exec = httpx.get(url_exec, headers=headers_exec, params=params_exec)
+                if resp_exec.status_code == 200 and resp_exec.json():
+                    logger.info("Early Logout Automation Skipped: Already executed today")
+                    return {"processed": False, "reason": "already_executed_today", "count": 0}
+            except Exception as e_exec:
+                logger.warning("Failed to check job execution log: %s", e_exec)
+                
+            from app.services.automation_job_log_service import automation_job_log_service
+            claimed = automation_job_log_service.claim_job("early_logout", execution_date)
+            if not claimed:
+                logger.info("Early Logout Automation Skipped: Already claimed/running")
+                return {"processed": False, "reason": "already_claimed", "count": 0}
+                
             sent = self.send_early_logout_alerts(target_date)
             logger.info("Early logout job completed count=%s target_date=%s", len(sent), target_date)
+            
+            status_val = "SUCCESS" if sent else "SKIPPED"
+            automation_job_log_service.finalize_job("early_logout", execution_date, status_val, details={"count": len(sent)})
             return {"processed": True, "count": len(sent), "target_date": target_date}
         except Exception as exc:
             logger.warning("Early logout job failed: %s", exc)

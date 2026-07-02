@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS email_automation_settings (
 
 CREATE TABLE IF NOT EXISTS email_preferences (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  employee_id UUID,
+  employee_id UUID UNIQUE,
   employee_name TEXT,
   employee_email TEXT,
   monthly_report_mode TEXT NOT NULL DEFAULT 'manual' CHECK (monthly_report_mode IN ('manual', 'auto')),

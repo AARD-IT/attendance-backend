@@ -694,7 +694,7 @@ class MinervaSyncService:
         import httpx
         try:
             # 1. Fetch employee profiles
-            profiles = SupabaseClient.fetch_profiles("EMPLOYEE")
+            profiles = SupabaseClient.get_all_profiles("EMPLOYEE")
             # Filter active minerva profiles
             active_profiles = [p for p in profiles if p.get("role") == "EMPLOYEE" and (p.get("emp_code") or p.get("minerva_employee_id"))]
             total_employees = len(active_profiles) if active_profiles else len(profiles)
@@ -745,7 +745,7 @@ class MinervaSyncService:
             return kpi_data
         except Exception as e:
             logger.error("Failed to calculate and cache KPIs: %s", e)
-            raise
+            return {}
 
     def sync_all_job(self) -> Dict[str, Any]:
         """Unified background sync orchestrator with fallback and logging."""

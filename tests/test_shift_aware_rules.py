@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from app.services.dashboard_analytics_service import DashboardAnalyticsService
 from app.services.shift_rules import get_shift_rule
+from app.services.attendance_shift_engine import AttendanceShiftEngine
 
 
 def test_get_shift_rule_normalizes_shift_2_case_insensitively():
@@ -36,7 +37,9 @@ def test_classify_record_uses_shift_assignment_for_login_and_logout_thresholds()
         "total_hours": 7.0,
     }
 
-    with patch.object(DashboardAnalyticsService, "_fetch_records", side_effect=lambda table: profile if table == "profiles" else assignments if table == "employee_shift_assignments" else [record]):
+    side_effect = lambda table: profile if table == "profiles" else assignments if table in ("employee_shift_assignments", "shift_assignments") else [record]
+    with patch.object(DashboardAnalyticsService, "_fetch_records", side_effect=side_effect), \
+         patch.object(AttendanceShiftEngine, "_fetch_records", side_effect=side_effect):
         classification = DashboardAnalyticsService._classify_record(record)
 
     assert classification["is_late"] is True
@@ -66,7 +69,9 @@ def test_classify_record_resolves_shift_assignment_by_employee_name_and_effectiv
         "total_hours": 7.0,
     }
 
-    with patch.object(DashboardAnalyticsService, "_fetch_records", side_effect=lambda table: profile if table == "profiles" else assignments if table == "employee_shift_assignments" else [record]):
+    side_effect = lambda table: profile if table == "profiles" else assignments if table in ("employee_shift_assignments", "shift_assignments") else [record]
+    with patch.object(DashboardAnalyticsService, "_fetch_records", side_effect=side_effect), \
+         patch.object(AttendanceShiftEngine, "_fetch_records", side_effect=side_effect):
         classification = DashboardAnalyticsService._classify_record(record)
 
     assert classification["is_late"] is True
@@ -94,7 +99,9 @@ def test_classify_record_treats_lowercase_shift_2_as_shift_2_rules():
         "total_hours": 7.0,
     }
 
-    with patch.object(DashboardAnalyticsService, "_fetch_records", side_effect=lambda table: profile if table == "profiles" else assignments if table == "employee_shift_assignments" else [record]):
+    side_effect = lambda table: profile if table == "profiles" else assignments if table in ("employee_shift_assignments", "shift_assignments") else [record]
+    with patch.object(DashboardAnalyticsService, "_fetch_records", side_effect=side_effect), \
+         patch.object(AttendanceShiftEngine, "_fetch_records", side_effect=side_effect):
         classification = DashboardAnalyticsService._classify_record(record)
 
     assert classification["is_late"] is False

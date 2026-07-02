@@ -249,7 +249,7 @@ def test_process_due_jobs_uses_previous_completed_month_for_reports(monkeypatch)
 
     class FakeDateTime(real_datetime):
         @classmethod
-        def now(cls):
+        def now(cls, tz=None):
             return real_datetime(2026, 7, 4, 9, 0)
 
     def fake_send_monthly_reports(target_month=None):
@@ -257,7 +257,20 @@ def test_process_due_jobs_uses_previous_completed_month_for_reports(monkeypatch)
         return []
 
     monkeypatch.setattr('app.services.automation_email_service.datetime', FakeDateTime)
-    monkeypatch.setattr('app.services.automation_settings_service.httpx.Client', lambda *args, **kwargs: None)
+    class MockResponse:
+        status_code = 200
+        text = "[]"
+        def json(self): return []
+    class MockClient:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, *args, **kwargs): return MockResponse()
+        def post(self, *args, **kwargs): return MockResponse()
+        def patch(self, *args, **kwargs): return MockResponse()
+    monkeypatch.setattr('app.services.automation_settings_service.httpx.Client', MockClient)
+    monkeypatch.setattr('app.services.automation_email_service.httpx.Client', MockClient)
+    monkeypatch.setattr('app.services.automation_email_service.httpx.get', lambda *args, **kwargs: MockResponse())
     monkeypatch.setattr('app.services.automation_email_service.automation_settings_service.get_settings', lambda: {
         'monthly_report_enabled': True,
         'monthly_report_day': 4,
@@ -270,6 +283,8 @@ def test_process_due_jobs_uses_previous_completed_month_for_reports(monkeypatch)
         'early_logout_time': '22:30',
     })
     monkeypatch.setattr(service, 'send_monthly_reports', fake_send_monthly_reports)
+    monkeypatch.setattr('app.services.automation_job_log_service.automation_job_log_service.claim_job', lambda *args, **kwargs: True)
+    monkeypatch.setattr('app.services.automation_job_log_service.automation_job_log_service.finalize_job', lambda *args, **kwargs: None)
 
     service.process_due_jobs()
 
@@ -282,7 +297,7 @@ def test_process_due_jobs_uses_delay_for_late_login_alerts(monkeypatch):
 
     class FakeDateTime(real_datetime):
         @classmethod
-        def now(cls):
+        def now(cls, tz=None):
             return real_datetime(2026, 7, 5, 18, 0)
 
     def fake_send_late_login_alerts(attendance_date=None):
@@ -290,7 +305,20 @@ def test_process_due_jobs_uses_delay_for_late_login_alerts(monkeypatch):
         return []
 
     monkeypatch.setattr('app.services.automation_email_service.datetime', FakeDateTime)
-    monkeypatch.setattr('app.services.automation_settings_service.httpx.Client', lambda *args, **kwargs: None)
+    class MockResponse:
+        status_code = 200
+        text = "[]"
+        def json(self): return []
+    class MockClient:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, *args, **kwargs): return MockResponse()
+        def post(self, *args, **kwargs): return MockResponse()
+        def patch(self, *args, **kwargs): return MockResponse()
+    monkeypatch.setattr('app.services.automation_settings_service.httpx.Client', MockClient)
+    monkeypatch.setattr('app.services.automation_email_service.httpx.Client', MockClient)
+    monkeypatch.setattr('app.services.automation_email_service.httpx.get', lambda *args, **kwargs: MockResponse())
     monkeypatch.setattr('app.services.automation_email_service.automation_settings_service.get_settings', lambda: {
         'monthly_report_enabled': False,
         'monthly_report_day': 4,
@@ -303,6 +331,8 @@ def test_process_due_jobs_uses_delay_for_late_login_alerts(monkeypatch):
         'early_logout_time': '22:30',
     })
     monkeypatch.setattr(service, 'send_late_login_alerts', fake_send_late_login_alerts)
+    monkeypatch.setattr('app.services.automation_job_log_service.automation_job_log_service.claim_job', lambda *args, **kwargs: True)
+    monkeypatch.setattr('app.services.automation_job_log_service.automation_job_log_service.finalize_job', lambda *args, **kwargs: None)
 
     service.process_due_jobs()
 

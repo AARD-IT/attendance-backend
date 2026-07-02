@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from app.services.attendance_shift_engine import AttendanceShiftEngine
+from app.services.dashboard_analytics_service import DashboardAnalyticsService
 
 
 def test_missing_punch_overrides_shift_deviations():
@@ -22,7 +23,9 @@ def test_missing_punch_overrides_shift_deviations():
         }
     ]
 
-    with patch.object(AttendanceShiftEngine, "_fetch_records", side_effect=lambda table: profile if table == "profiles" else assignments if table == "shift_assignments" else []):
+    side_effect = lambda table: profile if table == "profiles" else assignments if table in ("shift_assignments", "employee_shift_assignments") else []
+    with patch.object(AttendanceShiftEngine, "_fetch_records", side_effect=side_effect), \
+         patch.object(DashboardAnalyticsService, "_fetch_records", side_effect=side_effect):
         classification = AttendanceShiftEngine.classify_record(record)
 
     assert classification["status"] == "MISSING_PUNCH"
