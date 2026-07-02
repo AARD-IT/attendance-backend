@@ -61,7 +61,14 @@ class AttendanceService:
                 )
 
             if response.status_code != 200:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch attendance records")
+                logger.error(
+                    "Supabase fetch attendance failed | function=get_all_attendance | url=%s | params=%s | status_code=%s | response_text=%s",
+                    url, params, response.status_code, response.text
+                )
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Failed to fetch attendance records: status={response.status_code} body={response.text}"
+                )
 
             records = response.json()
             total = 0
@@ -77,8 +84,11 @@ class AttendanceService:
             return {"total": total, "page": page, "records": records}
 
         except httpx.RequestError as e:
-            logger.error(f"Error fetching attendance: {str(e)}")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Attendance service unavailable")
+            logger.error(
+                "Error fetching attendance request error | function=get_all_attendance | url=%s | params=%s | error=%s",
+                url, params, str(e), exc_info=True
+            )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Attendance service unavailable: {str(e)}")
 
     @staticmethod
     def get_daily_attendance(page: int = 1, limit: int = 20, employee_id: Optional[str] = None, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:

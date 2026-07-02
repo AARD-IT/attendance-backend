@@ -204,12 +204,16 @@ class EmailPreferencesService:
         with httpx.Client(timeout=10.0) as client:
             response = client.patch(
                 f"{self._table_url()}?employee_id=eq.{employee_id}",
-                headers=SUPABASE_HEADERS_SERVICE,
+                headers={**SUPABASE_HEADERS_SERVICE, "Prefer": "return=representation"},
                 json=payload,
             )
 
         rows = self._safe_json(response, action="update_preference", fallback=[])
-        updated = rows[0] if isinstance(rows, list) and rows else existing
+        if isinstance(rows, list) and rows:
+            updated = rows[0]
+        else:
+            # Supabase didn't return the row — construct it locally from existing + change
+            updated = {**existing, mode_type: mode_value}
         return self._enrich_preference_dynamically(updated)
 
 

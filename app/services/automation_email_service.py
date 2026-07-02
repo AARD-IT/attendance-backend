@@ -123,8 +123,31 @@ class AutomationEmailService:
         return email_reports_service._subject_for("monthly_report", context or {})
 
     def send_monthly_reports(self, target_month: str | None = None) -> List[Dict[str, Any]]:
+        import calendar
+        import traceback
         month_label = target_month or date.today().replace(day=1).isoformat()[:7]
-        records = attendance_service.get_all_attendance(limit=1000, start_date=f"{month_label}-01", end_date=f"{month_label}-31").get("records", [])
+        
+        try:
+            year = int(month_label[:4])
+            month = int(month_label[5:7])
+            last_day = calendar.monthrange(year, month)[1]
+        except (ValueError, IndexError) as e:
+            logger.warning("Failed to parse month_label %s, defaulting to 30 days: %s", month_label, e)
+            last_day = 30
+            
+        start_date = f"{month_label}-01"
+        end_date = f"{month_label}-{last_day:02d}"
+        logger.info("Fetching attendance for monthly report | function=send_monthly_reports | start_date=%s | end_date=%s", start_date, end_date)
+        
+        try:
+            records = attendance_service.get_all_attendance(limit=1000, start_date=start_date, end_date=end_date).get("records", [])
+        except Exception as exc:
+            logger.error(
+                "Failed to fetch attendance records inside send_monthly_reports | function=send_monthly_reports | month=%s | start_date=%s | end_date=%s | error=%s | traceback=%s",
+                month_label, start_date, end_date, str(exc), traceback.format_exc()
+            )
+            records = []
+            
         sent = []
         processed_employee_ids: set[str] = set()
 
@@ -136,7 +159,7 @@ class AutomationEmailService:
             recipient_email = str(record.get("employee_email") or record.get("recipient_email") or "")
             attendance_date = f"{month_label}-01"
             subject = self._monthly_report_subject(month_label, {"employee_id": employee_id, "employee_name": employee_name, "month": int(month_label[5:7]), "year": int(month_label[:4])})
-            if self._find_existing_monthly_report(employee_id, subject):
+            if email_reports_service._find_existing_monthly_report(employee_id, subject):
                 processed_employee_ids.add(employee_id)
                 continue
             activity = self._send_if_enabled(employee_id, employee_name, recipient_email, "monthly_report", attendance_date)
